@@ -40,6 +40,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_url,
     safe_url_for_log,
+    utf16_len,
 )
 
 
@@ -876,6 +877,11 @@ class FluxerAdapter(BasePlatformAdapter):
     # Hermes gateway uses this capability flag to display terminal tool commands
     # as clean fenced blocks in editable tool-progress messages.
     supports_code_blocks = True
+    # send() chunks with BasePlatformAdapter.truncate_message(). Advertising
+    # this keeps cron delivery from pre-truncating a multi-message report into a
+    # single 4,000-codepoint payload. That old path could still exceed Fluxer's
+    # 4,000 UTF-16-unit API limit when it contained astral emoji.
+    splits_long_messages = True
 
     def __init__(self, config: PlatformConfig):
         _ensure_fluxer_platform_registered()
@@ -1183,7 +1189,7 @@ class FluxerAdapter(BasePlatformAdapter):
 
         try:
             formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH)
+            chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH, len_fn=utf16_len)
             message_ids: List[str] = []
             responses: List[Dict[str, Any]] = []
 
@@ -1371,17 +1377,29 @@ class FluxerAdapter(BasePlatformAdapter):
         """
         try:
             formatted = self.format_message(content)
-            if len(formatted) > MAX_MESSAGE_LENGTH:
-                formatted = formatted[: MAX_MESSAGE_LENGTH - 3] + "..."
+            if utf16_len(formatted) > MAX_MESSAGE_LENGTH:
+                # Reuse the platform splitter's UTF-16 accounting so an emoji
+                # cannot make an apparently 4,000-character edit exceed the API
+                # limit. Keep the edit to one self-contained first chunk.
+                formatted = self.truncate_message(
+                    formatted,
+                    MAX_MESSAGE_LENGTH,
+                    len_fn=utf16_len,
+                )[0]
             data = await self._request(
                 "PATCH",
                 f"/channels/{_quote_id(chat_id)}/messages/{_quote_id(message_id)}",
                 json=self._outbound_message_payload(formatted),
             )
+            # Intermediate streaming edits are intentionally not content-checked:
+            # a later PATCH can land before this edit's GET read-back, making the
+            # read-back newer than ``formatted`` and producing a false mismatch.
+            # The final edit is stable and still gets exact visible-content
+            # verification; intermediate edits retain ID/author verification.
             verified = await self._verify_delivery(
                 chat_id,
                 str(data.get("id") or message_id),
-                expected_content=self._sanitize_outbound_mentions(formatted),
+                expected_content=(self._sanitize_outbound_mentions(formatted) if finalize else None),
             )
             raw_response = dict(data)
             raw_response["delivery_verified"] = verified is not None

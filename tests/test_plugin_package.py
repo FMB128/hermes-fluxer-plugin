@@ -1205,6 +1205,76 @@ def test_zero_duration_attachment_without_waveform_is_not_voice_message():
     assert fluxer_adapter._is_voice_message(data) is False
 
 
+def test_fluxer_advertises_native_long_message_chunking():
+    assert fluxer_adapter.FluxerAdapter.splits_long_messages is True
+
+
+@pytest.mark.asyncio
+async def test_long_cron_report_chunks_below_fluxer_utf16_limit(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "delivery_verification": False,
+            },
+        )
+    )
+    adapter._request = AsyncMock(side_effect=[{"id": "chunk-1"}, {"id": "chunk-2"}])
+    report = ("Monday infra line 😀\n" * 300).strip()
+
+    result = await adapter.send("chan-1", report)
+    payloads = [call.kwargs["json"]["content"] for call in adapter._request.await_args_list]
+
+    assert result.success is True
+    assert len(payloads) == 2
+    assert all(len(chunk.encode("utf-16-le")) // 2 <= fluxer_adapter.MAX_MESSAGE_LENGTH for chunk in payloads)
+
+
+@pytest.mark.asyncio
+async def test_intermediate_stream_edit_does_not_exact_verify_racy_content(monkeypatch):
+    """A newer stream edit can win before GET read-back, so only final content is exact-checked."""
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    adapter._request = AsyncMock(return_value={"id": "msg-stream"})
+    adapter._verify_delivery = AsyncMock(return_value={"id": "msg-stream", "content": "newer chunk"})
+
+    result = await adapter.edit_message("chan-1", "msg-stream", "older chunk", finalize=False)
+
+    assert result.success is True
+    adapter._verify_delivery.assert_awaited_once_with(
+        "chan-1",
+        "msg-stream",
+        expected_content=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_stream_edit_exact_verifies_visible_content(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    adapter._request = AsyncMock(return_value={"id": "msg-stream"})
+    adapter._verify_delivery = AsyncMock(return_value={"id": "msg-stream", "content": "final answer"})
+
+    result = await adapter.edit_message("chan-1", "msg-stream", "final answer", finalize=True)
+
+    assert result.success is True
+    adapter._verify_delivery.assert_awaited_once_with(
+        "chan-1",
+        "msg-stream",
+        expected_content="final answer",
+    )
+
+
 @pytest.mark.asyncio
 async def test_send_voice_uploads_fluxer_voice_message_payload(monkeypatch, tmp_path):
     monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)

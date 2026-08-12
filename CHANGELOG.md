@@ -9,6 +9,25 @@ This project uses simple semantic versioning while the plugin is young:
 - major versions only for breaking configuration or runtime behavior.
 
 
+## [0.2.5] - 2026-08-12
+
+### Fixed
+
+- Long cron reports now use Fluxer's native multi-message chunking instead of a single pre-truncated post that could still exceed the API's 4,000 UTF-16-unit limit.
+- Streaming read-back no longer reports false `content_mismatch` warnings when a newer partial edit wins the race; final edits are still checked exactly.
+
+### User impact
+
+- Weekly infrastructure reports can be delivered in full without HTTP 400 length failures.
+- Healthy live streaming no longer floods gateway logs with misleading delivery warnings.
+
+### Verification
+
+- `python -m py_compile adapter.py` → clean.
+- `pytest -q` → 200 passed locally.
+- Regression coverage verifies UTF-16-safe long-message chunking, non-racy intermediate verification, and exact final verification.
+
+
 ## [0.2.4] - 2026-07-01
 
 ### Fixed
