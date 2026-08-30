@@ -263,7 +263,7 @@ def _headers(bot_token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bot {bot_token}",
         "Content-Type": "application/json",
-        "User-Agent": "Hermes-Fluxer/0.2",
+        "User-Agent": "Hermes-Fluxer/0.3",
     }
 
 
@@ -271,7 +271,7 @@ def _auth_headers(bot_token: str) -> Dict[str, str]:
     """Headers for requests where httpx must set Content-Type itself."""
     return {
         "Authorization": f"Bot {bot_token}",
-        "User-Agent": "Hermes-Fluxer/0.2",
+        "User-Agent": "Hermes-Fluxer/0.3",
     }
 
 
@@ -1089,6 +1089,7 @@ class FluxerAdapter(BasePlatformAdapter):
         self._awaiting_heartbeat_ack = False
         self._closing = False
         self._seen_message_ids: OrderedDict[str, None] = OrderedDict()
+        self._last_inbound_by_chat: OrderedDict[str, str] = OrderedDict()
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._pending_exec_approvals: Dict[str, Dict[str, Any]] = {}
         self._pending_component_actions: Dict[str, Dict[str, Any]] = {}
@@ -1256,6 +1257,76 @@ class FluxerAdapter(BasePlatformAdapter):
             "PUT",
             f"/channels/{_quote_id(chat_id)}/messages/{_quote_id(message_id)}/reactions/{_quote_id(emoji)}/@me",
         )
+
+    async def add_reaction(
+        self,
+        chat_id: str,
+        emoji: str,
+        message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Add an explicit agent-requested reaction to a Fluxer message."""
+        if not str(emoji).strip():
+            return {"success": False, "error": "emoji is required"}
+        target = message_id or self._last_inbound_by_chat.get(str(chat_id))
+        if not target:
+            return {
+                "success": False,
+                "error": "no message to react to — pass message_id",
+            }
+        try:
+            await self._add_reaction(chat_id, target, emoji)
+        except Exception as exc:
+            logger.debug("Fluxer agent reaction failed (%s)", type(exc).__name__)
+            return {
+                "success": False,
+                "error": "reaction failed (see gateway debug log)",
+            }
+        return {"success": True, "message_id": target}
+
+    async def remove_reaction(
+        self,
+        chat_id: str,
+        message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Remove every reaction this bot owns on a Fluxer message."""
+        target = message_id or self._last_inbound_by_chat.get(str(chat_id))
+        if not target:
+            return {
+                "success": False,
+                "error": "no message to unreact — pass message_id",
+            }
+        try:
+            message = await self._request(
+                "GET",
+                f"/channels/{_quote_id(chat_id)}/messages/{_quote_id(target)}",
+            )
+            owned_emojis: List[str] = []
+            for reaction in message.get("reactions") or []:
+                if not isinstance(reaction, dict) or reaction.get("me") is not True:
+                    continue
+                emoji = reaction.get("emoji") or {}
+                if not isinstance(emoji, dict):
+                    continue
+                name = str(emoji.get("name") or "")
+                emoji_id = str(emoji.get("id") or "")
+                if name:
+                    owned_emojis.append(f"{name}:{emoji_id}" if emoji_id else name)
+            for emoji in owned_emojis:
+                await self._request(
+                    "DELETE",
+                    f"/channels/{_quote_id(chat_id)}/messages/{_quote_id(target)}/reactions/{_quote_id(emoji)}/@me",
+                )
+        except Exception as exc:
+            logger.debug("Fluxer agent unreact failed (%s)", type(exc).__name__)
+            return {
+                "success": False,
+                "error": "unreact failed (see gateway debug log)",
+            }
+        return {
+            "success": True,
+            "message_id": target,
+            "removed": len(owned_emojis),
+        }
 
     async def send(
         self,
@@ -1871,6 +1942,7 @@ class FluxerAdapter(BasePlatformAdapter):
             verified = await self._verify_delivery(
                 chat_id,
                 message_id,
+                expected_content=payload.get("content"),
                 expected_attachment_count=1,
             )
             raw_response = dict(data)
@@ -2123,7 +2195,7 @@ class FluxerAdapter(BasePlatformAdapter):
 
         if not is_safe_url(url):
             raise ValueError(f"Blocked unsafe Fluxer attachment URL: {safe_url_for_log(url)}")
-        headers = {"User-Agent": "Hermes-Fluxer/0.2", "Accept": "*/*"}
+        headers = {"User-Agent": "Hermes-Fluxer/0.3", "Accept": "*/*"}
         attachment_host = urlparse(url).netloc.lower()
         api_host = urlparse(self.api_base_url).netloc.lower()
         if attachment_host and api_host and attachment_host == api_host:
@@ -2765,6 +2837,9 @@ class FluxerAdapter(BasePlatformAdapter):
         if not message_id:
             return
         self._seen_message_ids.pop(message_id, None)
+        for chat_id, latest_id in list(self._last_inbound_by_chat.items()):
+            if latest_id == message_id:
+                self._last_inbound_by_chat.pop(chat_id, None)
         pending = self._pending_exec_approvals.pop(message_id, None)
         slash_cancel_action: Optional[Dict[str, Any]] = None
         for cid, state in list(self._pending_component_actions.items()):
@@ -2838,6 +2913,11 @@ class FluxerAdapter(BasePlatformAdapter):
         )
         if not should_process:
             return
+        if msg_id:
+            self._last_inbound_by_chat[channel_id] = msg_id
+            self._last_inbound_by_chat.move_to_end(channel_id)
+            while len(self._last_inbound_by_chat) > 1000:
+                self._last_inbound_by_chat.popitem(last=False)
         source = self.build_source(
             chat_id=channel_id,
             chat_name=(data.get("channel") or {}).get("name"),
@@ -3106,18 +3186,58 @@ async def _standalone_send(
     message: str,
     *,
     thread_id: Optional[str] = None,
-    media_files: Optional[List[str]] = None,
+    media_files: Optional[List[Any]] = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
     adapter = FluxerAdapter(pconfig)
     metadata = {"thread_id": thread_id} if thread_id else None
     try:
         last: Optional[SendResult] = None
-        if message:
+        sent_message_ids: List[str] = []
+
+        async def _rollback_partial_delivery() -> List[str]:
+            rollback_failures: List[str] = []
+            for message_id in reversed(sent_message_ids):
+                if not await adapter.delete_message(chat_id, message_id):
+                    rollback_failures.append(message_id)
+            return rollback_failures
+
+        media_items = media_files or []
+        native_caption: Optional[str] = None
+        if message and len(media_items) == 1:
+            media_item = media_items[0]
+            if isinstance(media_item, (tuple, list)):
+                media_path = str(media_item[0])
+                is_voice_directive = bool(media_item[1]) if len(media_item) > 1 else False
+            else:
+                media_path = str(media_item)
+                is_voice_directive = False
+            if force_document or not is_voice_directive:
+                candidate = message.strip()
+                # Mention neutralization adds one UTF-16 unit per recognized
+                # mention. Count the worst case so the final wire caption can
+                # never cross Fluxer's 4,000-unit limit.
+                mention_expansion = sum(
+                    len(pattern.findall(candidate))
+                    for pattern in (
+                        _MENTION_EVERYONE_RE,
+                        _MENTION_ROLE_RE,
+                        _MENTION_USER_RE,
+                    )
+                )
+                if (
+                    candidate
+                    and utf16_len(candidate) + mention_expansion
+                    <= MAX_MESSAGE_LENGTH
+                ):
+                    native_caption = candidate
+        if message and native_caption is None:
             last = await adapter.send(chat_id, message, metadata=metadata)
             if not last.success:
                 return {"error": last.error or "Fluxer send failed"}
-        for media_item in media_files or []:
+            if last.message_id:
+                sent_message_ids.append(last.message_id)
+        for media_item in media_items:
             if isinstance(media_item, (tuple, list)):
                 media_path = str(media_item[0])
                 is_voice_directive = bool(media_item[1]) if len(media_item) > 1 else False
@@ -3126,20 +3246,89 @@ async def _standalone_send(
                 is_voice_directive = False
             ext = Path(media_path).suffix.lower()
             if not force_document and ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
-                last = await adapter.send_image_file(chat_id, media_path, metadata=metadata)
+                last = await adapter.send_image_file(
+                    chat_id, media_path, caption=native_caption, metadata=metadata
+                )
             elif not force_document and ext in {".mp4", ".mov", ".webm", ".mkv", ".avi"}:
-                last = await adapter.send_video(chat_id, media_path, metadata=metadata)
-            elif not force_document and (is_voice_directive or ext in {".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac", ".aac"}):
+                last = await adapter.send_video(
+                    chat_id, media_path, caption=native_caption, metadata=metadata
+                )
+            elif not force_document and is_voice_directive:
                 last = await adapter.send_voice(chat_id, media_path, metadata=metadata)
             else:
-                last = await adapter.send_document(chat_id, media_path, metadata=metadata)
+                last = await adapter.send_document(
+                    chat_id, media_path, caption=native_caption, metadata=metadata
+                )
             if not last.success:
-                return {"error": last.error or "Fluxer media send failed"}
+                if not sent_message_ids:
+                    return {"error": "Fluxer media send failed"}
+                rollback_failures = await _rollback_partial_delivery()
+                if rollback_failures:
+                    return {
+                        "success": True,
+                        "platform": "fluxer",
+                        "chat_id": chat_id,
+                        "message_id": rollback_failures[-1],
+                        "partial_delivery": True,
+                        "warnings": [
+                            "Fluxer media delivery was incomplete; existing "
+                            "messages were kept to prevent duplicate retries"
+                        ],
+                    }
+                return {
+                    "error": (
+                        "Fluxer media send failed; partial delivery rolled back"
+                    ),
+                    "rollback_complete": True,
+                }
+            if last.message_id:
+                sent_message_ids.append(last.message_id)
         if last and last.success:
             return {"success": True, "platform": "fluxer", "chat_id": chat_id, "message_id": last.message_id}
         return {"error": "Fluxer send failed: empty message and no media"}
     except Exception as exc:
         return {"error": str(exc)}
+
+
+async def _send_message_handler(
+    args: Dict[str, Any],
+    chat_id: str,
+    _platform_name: str,
+    pconfig: PlatformConfig,
+    *,
+    normalized: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Preserve Fluxer MEDIA directives on every host send path."""
+    if normalized is not None:
+        cleaned_message = str(normalized.get("message") or "")
+        media_files = list(normalized.get("media_files") or [])
+        force_document = bool(normalized.get("force_document"))
+        thread_id = normalized.get("thread_id")
+    else:
+        raw_message = str(args.get("message") or "")
+        force_document = "[[as_document]]" in raw_message
+        media_files, cleaned_message = BasePlatformAdapter.extract_media(raw_message)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        thread_id = args.get("thread_id")
+    return await _standalone_send(
+        pconfig,
+        chat_id,
+        cleaned_message,
+        thread_id=str(thread_id) if thread_id else None,
+        media_files=media_files,
+        force_document=force_document,
+    )
+
+
+def _supports_normalized_send_handler_context() -> bool:
+    try:
+        from tools.send_message_tool import (
+            PLUGIN_SEND_HANDLER_NORMALIZED_CONTEXT,
+        )
+
+        return PLUGIN_SEND_HANDLER_NORMALIZED_CONTEXT >= 1
+    except (ImportError, TypeError):
+        return False
 
 
 def interactive_setup() -> None:
@@ -3163,6 +3352,11 @@ def register(ctx) -> None:
         apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="FLUXER_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        send_message_handler=(
+            _send_message_handler
+            if _supports_normalized_send_handler_context()
+            else None
+        ),
         allowed_users_env="FLUXER_ALLOWED_USERS",
         allow_all_env="FLUXER_ALLOW_ALL_USERS",
         max_message_length=MAX_MESSAGE_LENGTH,

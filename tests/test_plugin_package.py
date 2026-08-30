@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import os
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 try:
@@ -29,6 +29,580 @@ def restore_fluxer_env_after_test():
     os.environ.update(original)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("media_name", "method_name"),
+    [
+        ("photo.png", "send_image_file"),
+        ("clip.mp4", "send_video"),
+        ("report.pdf", "send_document"),
+    ],
+)
+async def test_standalone_single_media_uses_message_as_native_caption(
+    monkeypatch, tmp_path, media_name, method_name
+):
+    media_path = str(tmp_path / media_name)
+    fake = AsyncMock()
+    fake.send.return_value = fluxer_adapter.SendResult(success=True, message_id="text-id")
+    getattr(fake, method_name).return_value = fluxer_adapter.SendResult(
+        success=True, message_id="media-id"
+    )
+    monkeypatch.setattr(fluxer_adapter, "FluxerAdapter", lambda _config: fake)
+
+    result = await fluxer_adapter._standalone_send(
+        PlatformConfig(enabled=True),
+        "chan-1",
+        "Native caption",
+        media_files=[media_path],
+    )
+
+    assert result["success"] is True
+    assert result["message_id"] == "media-id"
+    fake.send.assert_not_awaited()
+    getattr(fake, method_name).assert_awaited_once_with(
+        "chan-1",
+        media_path,
+        caption="Native caption",
+        metadata=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_standalone_voice_keeps_text_separate_from_native_voice_message(
+    monkeypatch, tmp_path
+):
+    media_path = str(tmp_path / "voice.ogg")
+    fake = AsyncMock()
+    fake.send.return_value = fluxer_adapter.SendResult(success=True, message_id="text-id")
+    fake.send_voice.return_value = fluxer_adapter.SendResult(
+        success=True, message_id="voice-id"
+    )
+    monkeypatch.setattr(fluxer_adapter, "FluxerAdapter", lambda _config: fake)
+
+    result = await fluxer_adapter._standalone_send(
+        PlatformConfig(enabled=True),
+        "chan-1",
+        "Voice introduction",
+        media_files=[(media_path, True)],
+    )
+
+    assert result["success"] is True
+    assert result["message_id"] == "voice-id"
+    fake.send.assert_awaited_once_with("chan-1", "Voice introduction", metadata=None)
+    fake.send_voice.assert_awaited_once_with(
+        "chan-1", media_path, metadata=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_standalone_plain_audio_is_a_document_with_native_caption(
+    monkeypatch, tmp_path
+):
+    media_path = str(tmp_path / "audio.ogg")
+    fake = AsyncMock()
+    fake.send_document.return_value = fluxer_adapter.SendResult(
+        success=True, message_id="audio-file-id"
+    )
+    monkeypatch.setattr(fluxer_adapter, "FluxerAdapter", lambda _config: fake)
+
+    result = await fluxer_adapter._standalone_send(
+        PlatformConfig(enabled=True),
+        "chan-1",
+        "Audio attachment",
+        media_files=[media_path],
+    )
+
+    assert result["success"] is True
+    fake.send.assert_not_awaited()
+    fake.send_voice.assert_not_awaited()
+    fake.send_document.assert_awaited_once_with(
+        "chan-1",
+        media_path,
+        caption="Audio attachment",
+        metadata=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_standalone_rolls_back_text_after_media_failure(monkeypatch, tmp_path):
+    media_path = str(tmp_path / "voice.ogg")
+    fake = AsyncMock()
+    fake.send.return_value = fluxer_adapter.SendResult(
+        success=True, message_id="text-id"
+    )
+    fake.send_voice.return_value = fluxer_adapter.SendResult(
+        success=False, error="upload failed"
+    )
+    fake.delete_message.return_value = True
+    monkeypatch.setattr(fluxer_adapter, "FluxerAdapter", lambda _config: fake)
+
+    result = await fluxer_adapter._standalone_send(
+        PlatformConfig(enabled=True),
+        "chan-1",
+        "Voice introduction",
+        media_files=[(media_path, True)],
+    )
+
+    assert result == {
+        "error": "Fluxer media send failed; partial delivery rolled back",
+        "rollback_complete": True,
+    }
+    fake.delete_message.assert_awaited_once_with("chan-1", "text-id")
+
+
+@pytest.mark.asyncio
+async def test_standalone_media_only_failure_does_not_claim_a_rollback(
+    monkeypatch, tmp_path
+):
+    media_path = str(tmp_path / "report.pdf")
+    fake = AsyncMock()
+    fake.send_document.return_value = fluxer_adapter.SendResult(
+        success=False, error="upload failed"
+    )
+    monkeypatch.setattr(fluxer_adapter, "FluxerAdapter", lambda _config: fake)
+
+    result = await fluxer_adapter._standalone_send(
+        PlatformConfig(enabled=True),
+        "chan-1",
+        "",
+        media_files=[media_path],
+    )
+
+    assert result == {"error": "Fluxer media send failed"}
+    fake.delete_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_standalone_marks_incomplete_rollback_success_to_prevent_retry(
+    monkeypatch, tmp_path
+):
+    media_path = str(tmp_path / "voice.ogg")
+    fake = AsyncMock()
+    fake.send.return_value = fluxer_adapter.SendResult(
+        success=True, message_id="text-id"
+    )
+    fake.send_voice.return_value = fluxer_adapter.SendResult(
+        success=False, error="upload failed"
+    )
+    fake.delete_message.return_value = False
+    monkeypatch.setattr(fluxer_adapter, "FluxerAdapter", lambda _config: fake)
+
+    result = await fluxer_adapter._standalone_send(
+        PlatformConfig(enabled=True),
+        "chan-1",
+        "Voice introduction",
+        media_files=[(media_path, True)],
+    )
+
+    assert result == {
+        "success": True,
+        "platform": "fluxer",
+        "chat_id": "chan-1",
+        "message_id": "text-id",
+        "partial_delivery": True,
+        "warnings": [
+            "Fluxer media delivery was incomplete; existing messages were kept "
+            "to prevent duplicate retries"
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_standalone_uses_utf16_length_for_native_caption(monkeypatch, tmp_path):
+    media_path = str(tmp_path / "photo.png")
+    fake = AsyncMock()
+    fake.send.return_value = fluxer_adapter.SendResult(
+        success=True, message_id="text-id"
+    )
+    fake.send_image_file.return_value = fluxer_adapter.SendResult(
+        success=True, message_id="image-id"
+    )
+    monkeypatch.setattr(fluxer_adapter, "FluxerAdapter", lambda _config: fake)
+    caption = "😀" * 2001
+
+    result = await fluxer_adapter._standalone_send(
+        PlatformConfig(enabled=True),
+        "chan-1",
+        caption,
+        media_files=[media_path],
+    )
+
+    assert result["success"] is True
+    fake.send.assert_awaited_once_with("chan-1", caption, metadata=None)
+    fake.send_image_file.assert_awaited_once_with(
+        "chan-1", media_path, caption=None, metadata=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_send_handler_preserves_media_and_force_document(tmp_path, monkeypatch):
+    image = tmp_path / "original.png"
+    image.write_bytes(b"not-a-real-png")
+    standalone = AsyncMock(return_value={"success": True, "message_id": "media-id"})
+    monkeypatch.setattr(fluxer_adapter, "_standalone_send", standalone)
+    config = PlatformConfig(enabled=True)
+
+    result = await fluxer_adapter._send_message_handler(
+        {
+            "message": f"[[as_document]]\nMEDIA:{image}\nNative caption",
+            "thread_id": "thread-1",
+        },
+        "chan-1",
+        "fluxer",
+        config,
+    )
+
+    assert result == {"success": True, "message_id": "media-id"}
+    standalone.assert_awaited_once_with(
+        config,
+        "chan-1",
+        "Native caption",
+        thread_id="thread-1",
+        media_files=[(str(image.resolve()), False)],
+        force_document=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_send_handler_preserves_plain_text_exactly(monkeypatch):
+    standalone = AsyncMock(return_value={"success": True, "message_id": "text-id"})
+    monkeypatch.setattr(fluxer_adapter, "_standalone_send", standalone)
+    config = PlatformConfig(enabled=True)
+
+    result = await fluxer_adapter._send_message_handler(
+        {"message": "  intentional spacing  "},
+        "chan-1",
+        "fluxer",
+        config,
+    )
+
+    assert result == {"success": True, "message_id": "text-id"}
+    standalone.assert_awaited_once_with(
+        config,
+        "chan-1",
+        "  intentional spacing  ",
+        thread_id=None,
+        media_files=[],
+        force_document=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_handler_prefers_host_normalized_cron_context(monkeypatch, tmp_path):
+    standalone = AsyncMock(return_value={"success": True, "message_id": "cron-id"})
+    monkeypatch.setattr(fluxer_adapter, "_standalone_send", standalone)
+    config = PlatformConfig(enabled=True)
+    media_path = str(tmp_path / "report.pdf")
+    media_files = [(media_path, False)]
+
+    result = await fluxer_adapter._send_message_handler(
+        {},
+        "chan-1",
+        "fluxer",
+        config,
+        normalized={
+            "message": "Scheduled report",
+            "thread_id": "thread-1",
+            "media_files": media_files,
+            "force_document": True,
+        },
+    )
+
+    assert result == {"success": True, "message_id": "cron-id"}
+    standalone.assert_awaited_once_with(
+        config,
+        "chan-1",
+        "Scheduled report",
+        thread_id="thread-1",
+        media_files=media_files,
+        force_document=True,
+    )
+
+
+def test_register_exposes_full_request_send_handler(monkeypatch):
+    monkeypatch.setattr(
+        fluxer_adapter, "_supports_normalized_send_handler_context", lambda: True
+    )
+
+    class Context:
+        kwargs = None
+
+        def register_platform(self, **kwargs):
+            self.kwargs = kwargs
+
+    ctx = Context()
+    fluxer_adapter.register(ctx)
+
+    assert ctx.kwargs is not None
+    assert ctx.kwargs["send_message_handler"] is fluxer_adapter._send_message_handler
+    assert ctx.kwargs["standalone_sender_fn"] is fluxer_adapter._standalone_send
+
+
+def test_register_omits_full_request_handler_on_older_hermes(monkeypatch):
+    monkeypatch.setattr(
+        fluxer_adapter, "_supports_normalized_send_handler_context", lambda: False
+    )
+
+    class Context:
+        kwargs = None
+
+        def register_platform(self, **kwargs):
+            self.kwargs = kwargs
+
+    ctx = Context()
+    fluxer_adapter.register(ctx)
+
+    assert ctx.kwargs is not None
+    assert ctx.kwargs["send_message_handler"] is None
+    assert ctx.kwargs["standalone_sender_fn"] is fluxer_adapter._standalone_send
+
+
+@pytest.mark.asyncio
+async def test_agent_reaction_defaults_to_last_processed_inbound_message(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_REQUIRE_MENTION", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "require_mention": False,
+            },
+        )
+    )
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_message_create(
+        {
+            "id": "msg-latest",
+            "channel_id": "chan-1",
+            "channel_type": "channel",
+            "content": "React to this",
+            "author": {"id": "owner-user", "username": "Alice", "bot": False},
+        },
+        {"op": 0, "t": "MESSAGE_CREATE", "d": {}},
+    )
+    adapter._request = AsyncMock(return_value={})
+
+    result = await adapter.add_reaction("chan-1", "👍")
+
+    assert result == {"success": True, "message_id": "msg-latest"}
+    adapter._request.assert_awaited_once_with(
+        "PUT",
+        "/channels/chan-1/messages/msg-latest/reactions/%F0%9F%91%8D/@me",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_reaction_requires_a_target_message(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(return_value={})
+
+    result = await adapter.add_reaction("chan-1", "👍")
+
+    assert result == {
+        "success": False,
+        "error": "no message to react to — pass message_id",
+    }
+    adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_reaction_failure_does_not_expose_api_error(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(side_effect=RuntimeError("private upstream body"))
+
+    result = await adapter.add_reaction("chan-1", "👍", message_id="msg-explicit")
+
+    assert result == {
+        "success": False,
+        "error": "reaction failed (see gateway debug log)",
+    }
+    assert "private upstream body" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_agent_reaction_rejects_an_empty_emoji(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(return_value={})
+
+    result = await adapter.add_reaction("chan-1", "", message_id="msg-explicit")
+
+    assert result == {"success": False, "error": "emoji is required"}
+    adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_unreact_removes_every_reaction_owned_by_the_bot(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(
+        side_effect=[
+            {
+                "id": "msg-explicit",
+                "reactions": [
+                    {"emoji": {"id": None, "name": "👍"}, "count": 2, "me": True},
+                    {"emoji": {"id": "123", "name": "party"}, "count": 1, "me": True},
+                    {"emoji": {"id": None, "name": "❤️"}, "count": 1, "me": False},
+                ],
+            },
+            {},
+            {},
+        ]
+    )
+
+    result = await adapter.remove_reaction("chan-1", message_id="msg-explicit")
+
+    assert result == {"success": True, "message_id": "msg-explicit", "removed": 2}
+    assert adapter._request.await_args_list == [
+        call("GET", "/channels/chan-1/messages/msg-explicit"),
+        call(
+            "DELETE",
+            "/channels/chan-1/messages/msg-explicit/reactions/%F0%9F%91%8D/@me",
+        ),
+        call(
+            "DELETE",
+            "/channels/chan-1/messages/msg-explicit/reactions/party%3A123/@me",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_unreact_requires_a_target_message(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(return_value={})
+
+    result = await adapter.remove_reaction("chan-1")
+
+    assert result == {
+        "success": False,
+        "error": "no message to unreact — pass message_id",
+    }
+    adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_unreact_failure_does_not_expose_api_error(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(side_effect=RuntimeError("private upstream body"))
+
+    result = await adapter.remove_reaction("chan-1", message_id="msg-explicit")
+
+    assert result == {
+        "success": False,
+        "error": "unreact failed (see gateway debug log)",
+    }
+    assert "private upstream body" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_deleted_latest_inbound_is_not_used_as_reaction_target(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_REQUIRE_MENTION", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "require_mention": False,
+            },
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    await adapter._handle_message_create(
+        {
+            "id": "msg-deleted",
+            "channel_id": "chan-1",
+            "channel_type": "channel",
+            "content": "This will be deleted",
+            "author": {"id": "owner-user", "username": "Alice", "bot": False},
+        },
+        {"op": 0, "t": "MESSAGE_CREATE", "d": {}},
+    )
+    await adapter._handle_message_delete(
+        {"id": "msg-deleted", "channel_id": "chan-1"}
+    )
+    adapter._request = AsyncMock(return_value={})
+
+    result = await adapter.add_reaction("chan-1", "👍")
+
+    assert result == {
+        "success": False,
+        "error": "no message to react to — pass message_id",
+    }
+    adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reaction_target_history_is_bounded(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_REQUIRE_MENTION", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "require_mention": False,
+            },
+        )
+    )
+    adapter.handle_message = AsyncMock()
+
+    for index in range(1001):
+        await adapter._handle_message_create(
+            {
+                "id": f"msg-{index}",
+                "channel_id": f"chan-{index}",
+                "channel_type": "channel",
+                "content": "remember me",
+                "author": {"id": "owner-user", "username": "Alice", "bot": False},
+            },
+            {"op": 0, "t": "MESSAGE_CREATE", "d": {}},
+        )
+
+    assert len(adapter._last_inbound_by_chat) == 1000
+    assert "chan-0" not in adapter._last_inbound_by_chat
+    assert adapter._last_inbound_by_chat["chan-1000"] == "msg-1000"
+
+
 def test_plugin_manifest_is_platform_plugin():
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
 
@@ -46,6 +620,17 @@ def test_plugin_manifest_is_platform_plugin():
         "FLUXER_VOICE_STT_PROVIDER",
         "FLUXER_VOICE_CONTEXT_FILE",
     }.issubset(optional)
+
+
+def test_release_metadata_matches_v033_changelog():
+    manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        project = tomllib.load(handle)["project"]
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert manifest["version"] == "0.3.3"
+    assert project["version"] == "0.3.3"
+    assert "## [0.3.3] - 2026-08-30" in changelog
 
 
 def test_fluxer_adapter_advertises_markdown_code_blocks():
@@ -88,8 +673,8 @@ def test_asyncio_wait_for_timeout_handlers_are_python310_safe():
 def test_user_agent_version_matches_release_manifest():
     source = (ROOT / "adapter.py").read_text(encoding="utf-8")
 
-    assert "Hermes-Fluxer/0.1" not in source
-    assert "Hermes-Fluxer/0.2" in source
+    assert "Hermes-Fluxer/0.2" not in source
+    assert "Hermes-Fluxer/0.3" in source
 
 
 def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
@@ -1492,6 +2077,39 @@ async def test_send_voice_uploads_fluxer_voice_message_payload(monkeypatch, tmp_
         {"id": 0, "filename": "reply.ogg", "title": "reply.ogg", "duration": 5, "waveform": "BBBB"}
     ]
     assert kwargs["files"][0][0] == "files[0]"
+
+
+@pytest.mark.asyncio
+async def test_file_caption_is_included_in_delivery_verification(monkeypatch, tmp_path):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    image_path = tmp_path / "caption.png"
+    image_path.write_bytes(b"fake-png")
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._multipart_request = AsyncMock(return_value={"id": "msg-caption"})
+    adapter._verify_delivery = AsyncMock(
+        return_value={
+            "id": "msg-caption",
+            "content": "Caption @\u200beveryone",
+            "attachments": [{"id": "0"}],
+        }
+    )
+
+    result = await adapter.send_image_file(
+        "chan-1", str(image_path), caption="Caption @everyone"
+    )
+
+    assert result.success is True
+    adapter._verify_delivery.assert_awaited_once_with(
+        "chan-1",
+        "msg-caption",
+        expected_content="Caption @\u200beveryone",
+        expected_attachment_count=1,
+    )
 
 
 def test_pyproject_has_runtime_dependencies():

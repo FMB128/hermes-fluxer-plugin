@@ -9,6 +9,65 @@ This project uses simple semantic versioning while the plugin is young:
 - major versions only for breaking configuration or runtime behavior.
 
 
+## [0.3.3] - 2026-08-30
+
+### Fixed
+
+- Scheduled and manual Fluxer deliveries no longer lose their text, attachments, or reply target when they do not originate from a model tool call.
+- Ordinary audio files stay ordinary attachments; only explicit voice-note directives create native voice bubbles.
+- Attachment captions now respect Fluxer's UTF-16 message limit and are included in exact delivery readback.
+- If an attachment fails after accompanying text was posted, Hermes removes the partial send before reporting a retryable failure. If cleanup itself fails, it reports partial success instead of encouraging a duplicate retry.
+- Older Hermes hosts that cannot pass normalized plugin-send context now fall back safely instead of enabling an incompatible full-request handler.
+
+### Verification
+
+- Host-contract and plugin regressions cover CLI/cron sends without model arguments, normalized thread/media forwarding, legacy handler compatibility, audio-vs-voice routing, partial-delivery cleanup, UTF-16 captions, and caption readback.
+
+
+## [0.3.2] - 2026-08-30
+
+### Fixed
+
+- Images, documents, videos, and voice notes sent through Hermes' live `send_message` tool now reach Fluxer instead of being reduced to text-only messages.
+- Live Gateway delivery now uses the same attachment, caption, voice-note, and document-routing behavior as standalone and scheduled sends.
+
+### Verification
+
+- Focused regressions prove that full live-tool requests retain safe media files, captions, voice directives, and explicit document delivery before they reach Fluxer.
+- The full supported Python matrix and live provider readback are release gates for this patch.
+
+
+## [0.3.1] - 2026-08-30
+
+### Fixed
+
+- A single image, video, or document sent with a short message now keeps that message as the attachment's native caption instead of posting a separate text bubble followed by an uncaptioned file.
+
+### Verification
+
+- Focused regressions cover image, video, and document captions while preserving the separate text-plus-audio behavior required for native voice messages.
+- Live provider readback exposed the split-caption defect before the fix; the corrected v0.3.1 path is rechecked during the release acceptance run.
+
+
+## [0.3.0] - 2026-08-30
+
+### Added
+
+- Hermes can now add or remove its own reaction on a Fluxer message through the standard `send_message` react/unreact actions.
+- When no message ID is supplied, the reaction targets the latest user message that Hermes actually accepted in that chat.
+
+### User impact
+
+- The agent can acknowledge, celebrate, or quietly signal that it has seen a message without posting another text reply.
+- Removed messages and ignored group chatter are not retained as automatic reaction targets.
+
+### Verification
+
+- `pytest -q` → 220 passed on Python 3.10, 3.11, and 3.12.
+- Python compilation, Ruff, Bandit, dependency audit, diff checks, and secret-shape checks passed.
+- Focused reaction regressions cover explicit and automatic targets, Unicode and custom emoji, removal, deleted messages, bounded state, and private-error handling.
+
+
 ## [0.2.6] - 2026-08-30
 
 ### Fixed
