@@ -9,6 +9,27 @@ This project uses simple semantic versioning while the plugin is young:
 - major versions only for breaking configuration or runtime behavior.
 
 
+## [0.2.6] - 2026-08-30
+
+### Fixed
+
+- Made the Hermes dependency check passive, leaving credential validation to the adapter config validator. This keeps Fluxer available when a multiplexed profile stores its token in profile-scoped `PlatformConfig.extra` rather than the process environment.
+- Made Fluxer environment reads and `config.yaml` bridging profile-safe: secondary profiles resolve credentials and access-policy settings from the active Hermes secret scope, do not leak them into process-global environment variables, and retain YAML values as adapter-scoped extras.
+- Isolated realtime voice child processes from inherited primary-profile Fluxer settings, including bot credentials and access policy.
+- Added bounded retries for Fluxer REST `429` responses. The adapter honors `Retry-After` or Fluxer's JSON `retry_after`, and rewinds multipart files before retrying uploads.
+- Applied mention safety before Fluxer's 4,000 UTF-16-unit limit, preventing neutralized mentions from making a boundary-length send or edit too large.
+
+### Compatibility review
+
+- Rechecked the plugin against Fluxer server/Gateway source as of 2026-08-30, including bot gateway discovery, opcode/event shapes, message and multipart upload routes, attachment-provenance enforcement, interactions, reactions, pins, typing, threads, and the LiveKit voice handshake.
+- Rechecked registration, lifecycle, source scoping, standalone delivery, multiplexed profiles, and relay-exclusive deployment behavior against Hermes `origin/main` at `26350357d76e4508c8df9304a3374bdc5a6f6220`.
+- Documented how the direct Fluxer plugin relates to Hermes Relay. A deployment with `GATEWAY_RELAY_URL` set disables direct messaging adapters by default; operators who intentionally keep Fluxer direct must set `GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS=true`.
+
+### Verification
+
+- `PYTHONPATH=<current-hermes-origin-main>:. pytest -q` → 209 passed.
+- `python -m py_compile adapter.py __init__.py livekit_bridge.py xai_realtime.py scripts/*.py tools/*.py` → clean.
+
 ## [0.2.5] - 2026-08-12
 
 ### Fixed
@@ -26,7 +47,6 @@ This project uses simple semantic versioning while the plugin is young:
 - `python -m py_compile adapter.py` → clean.
 - `pytest -q` → 200 passed locally.
 - Regression coverage verifies UTF-16-safe long-message chunking, non-racy intermediate verification, and exact final verification.
-
 
 ## [0.2.4] - 2026-07-01
 

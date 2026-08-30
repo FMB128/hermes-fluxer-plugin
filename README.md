@@ -51,6 +51,18 @@ Fluxer user
 
 The adapter is deliberately conservative. Group chats are mention-gated by default, user access is deny-by-default unless configured, and deployment-dependent Fluxer features fall back to plain text/reaction flows where possible.
 
+### Direct Fluxer vs. Hermes Relay
+
+This plugin is a **direct** platform adapter: it connects Hermes to Fluxer's bot REST API, Gateway WebSocket, and optional LiveKit voice service. Fluxer's own internal gateway/service relays are server implementation details and do not require a second plugin connection.
+
+[Hermes Relay](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/relay) is a separate, alternative connector path for platforms fronted by a relay service. Current Hermes treats a process-level `GATEWAY_RELAY_URL` as relay-exclusive and disables direct messaging adapters, including Fluxer, unless you explicitly opt into a mixed deployment:
+
+```bash
+GATEWAY_RELAY_ALLOW_DIRECT_PLATFORMS=true
+```
+
+Use that opt-out only when Fluxer should remain directly connected beside a relay-fronted platform. If a connector itself fronts Fluxer, advertise Fluxer through `GATEWAY_RELAY_PLATFORMS` instead and avoid running both ingress paths for the same bot unless you have deliberate deduplication.
+
 ## Current support
 
 Implemented:

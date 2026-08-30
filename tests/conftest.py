@@ -95,6 +95,32 @@ except ModuleNotFoundError:
                 raise FileNotFoundError(file_path)
             return path
 
+        @staticmethod
+        def truncate_message(
+            content: str,
+            max_length: int = 4096,
+            len_fn: Any = None,
+        ) -> list[str]:
+            """Small standalone-test equivalent of Hermes' unit-aware splitter."""
+            measure = len_fn or len
+            chunks: list[str] = []
+            remaining = content
+            while remaining:
+                if measure(remaining) <= max_length:
+                    chunks.append(remaining)
+                    break
+                low, high = 1, len(remaining)
+                while low < high:
+                    mid = (low + high + 1) // 2
+                    if measure(remaining[:mid]) <= max_length:
+                        low = mid
+                    else:
+                        high = mid - 1
+                split_at = max(1, low)
+                chunks.append(remaining[:split_at])
+                remaining = remaining[split_at:]
+            return chunks
+
     async def _cache_from_url(url: str, *_args: Any, **_kwargs: Any) -> str:
         return url
 
@@ -105,6 +131,9 @@ except ModuleNotFoundError:
 
     def safe_url_for_log(url: str) -> str:
         return url
+
+    def utf16_len(value: str) -> int:
+        return len(value.encode("utf-16-le")) // 2
 
     config_mod.Platform = Platform
     config_mod.PlatformConfig = PlatformConfig
@@ -117,6 +146,7 @@ except ModuleNotFoundError:
     base_mod.cache_document_from_bytes = cache_document_from_bytes
     base_mod.cache_image_from_url = _cache_from_url
     base_mod.safe_url_for_log = safe_url_for_log
+    base_mod.utf16_len = utf16_len
 
     sys.modules.setdefault("gateway", gateway_pkg)
     sys.modules.setdefault("gateway.config", config_mod)
