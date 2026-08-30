@@ -1942,6 +1942,7 @@ class FluxerAdapter(BasePlatformAdapter):
             verified = await self._verify_delivery(
                 chat_id,
                 message_id,
+                expected_content=payload.get("content"),
                 expected_attachment_count=1,
             )
             raw_response = dict(data)
@@ -3185,13 +3186,22 @@ async def _standalone_send(
     message: str,
     *,
     thread_id: Optional[str] = None,
-    media_files: Optional[List[str]] = None,
+    media_files: Optional[List[Any]] = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
     adapter = FluxerAdapter(pconfig)
     metadata = {"thread_id": thread_id} if thread_id else None
     try:
         last: Optional[SendResult] = None
+        sent_message_ids: List[str] = []
+
+        async def _rollback_partial_delivery() -> List[str]:
+            rollback_failures: List[str] = []
+            for message_id in reversed(sent_message_ids):
+                if not await adapter.delete_message(chat_id, message_id):
+                    rollback_failures.append(message_id)
+            return rollback_failures
+
         media_items = media_files or []
         native_caption: Optional[str] = None
         if message and len(media_items) == 1:
@@ -3202,18 +3212,31 @@ async def _standalone_send(
             else:
                 media_path = str(media_item)
                 is_voice_directive = False
-            ext = Path(media_path).suffix.lower()
-            is_voice_or_audio = is_voice_directive or ext in {
-                ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac", ".aac"
-            }
-            if force_document or not is_voice_or_audio:
+            if force_document or not is_voice_directive:
                 candidate = message.strip()
-                if candidate and len(candidate) <= MAX_MESSAGE_LENGTH:
+                # Mention neutralization adds one UTF-16 unit per recognized
+                # mention. Count the worst case so the final wire caption can
+                # never cross Fluxer's 4,000-unit limit.
+                mention_expansion = sum(
+                    len(pattern.findall(candidate))
+                    for pattern in (
+                        _MENTION_EVERYONE_RE,
+                        _MENTION_ROLE_RE,
+                        _MENTION_USER_RE,
+                    )
+                )
+                if (
+                    candidate
+                    and utf16_len(candidate) + mention_expansion
+                    <= MAX_MESSAGE_LENGTH
+                ):
                     native_caption = candidate
         if message and native_caption is None:
             last = await adapter.send(chat_id, message, metadata=metadata)
             if not last.success:
                 return {"error": last.error or "Fluxer send failed"}
+            if last.message_id:
+                sent_message_ids.append(last.message_id)
         for media_item in media_items:
             if isinstance(media_item, (tuple, list)):
                 media_path = str(media_item[0])
@@ -3230,14 +3253,36 @@ async def _standalone_send(
                 last = await adapter.send_video(
                     chat_id, media_path, caption=native_caption, metadata=metadata
                 )
-            elif not force_document and (is_voice_directive or ext in {".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac", ".aac"}):
+            elif not force_document and is_voice_directive:
                 last = await adapter.send_voice(chat_id, media_path, metadata=metadata)
             else:
                 last = await adapter.send_document(
                     chat_id, media_path, caption=native_caption, metadata=metadata
                 )
             if not last.success:
-                return {"error": last.error or "Fluxer media send failed"}
+                if not sent_message_ids:
+                    return {"error": "Fluxer media send failed"}
+                rollback_failures = await _rollback_partial_delivery()
+                if rollback_failures:
+                    return {
+                        "success": True,
+                        "platform": "fluxer",
+                        "chat_id": chat_id,
+                        "message_id": rollback_failures[-1],
+                        "partial_delivery": True,
+                        "warnings": [
+                            "Fluxer media delivery was incomplete; existing "
+                            "messages were kept to prevent duplicate retries"
+                        ],
+                    }
+                return {
+                    "error": (
+                        "Fluxer media send failed; partial delivery rolled back"
+                    ),
+                    "rollback_complete": True,
+                }
+            if last.message_id:
+                sent_message_ids.append(last.message_id)
         if last and last.success:
             return {"success": True, "platform": "fluxer", "chat_id": chat_id, "message_id": last.message_id}
         return {"error": "Fluxer send failed: empty message and no media"}
@@ -3250,13 +3295,21 @@ async def _send_message_handler(
     chat_id: str,
     _platform_name: str,
     pconfig: PlatformConfig,
+    *,
+    normalized: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Preserve Fluxer MEDIA directives on the core full-request path."""
-    raw_message = str(args.get("message") or "")
-    force_document = "[[as_document]]" in raw_message
-    media_files, cleaned_message = BasePlatformAdapter.extract_media(raw_message)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-    thread_id = args.get("thread_id")
+    """Preserve Fluxer MEDIA directives on every host send path."""
+    if normalized is not None:
+        cleaned_message = str(normalized.get("message") or "")
+        media_files = list(normalized.get("media_files") or [])
+        force_document = bool(normalized.get("force_document"))
+        thread_id = normalized.get("thread_id")
+    else:
+        raw_message = str(args.get("message") or "")
+        force_document = "[[as_document]]" in raw_message
+        media_files, cleaned_message = BasePlatformAdapter.extract_media(raw_message)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        thread_id = args.get("thread_id")
     return await _standalone_send(
         pconfig,
         chat_id,
@@ -3265,6 +3318,17 @@ async def _send_message_handler(
         media_files=media_files,
         force_document=force_document,
     )
+
+
+def _supports_normalized_send_handler_context() -> bool:
+    try:
+        from tools.send_message_tool import (
+            PLUGIN_SEND_HANDLER_NORMALIZED_CONTEXT,
+        )
+
+        return PLUGIN_SEND_HANDLER_NORMALIZED_CONTEXT >= 1
+    except (ImportError, TypeError):
+        return False
 
 
 def interactive_setup() -> None:
@@ -3288,7 +3352,11 @@ def register(ctx) -> None:
         apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="FLUXER_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
-        send_message_handler=_send_message_handler,
+        send_message_handler=(
+            _send_message_handler
+            if _supports_normalized_send_handler_context()
+            else None
+        ),
         allowed_users_env="FLUXER_ALLOWED_USERS",
         allow_all_env="FLUXER_ALLOW_ALL_USERS",
         max_message_length=MAX_MESSAGE_LENGTH,

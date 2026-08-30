@@ -9,6 +9,21 @@ This project uses simple semantic versioning while the plugin is young:
 - major versions only for breaking configuration or runtime behavior.
 
 
+## [0.3.3] - 2026-08-30
+
+### Fixed
+
+- Scheduled and manual Fluxer deliveries no longer lose their text, attachments, or reply target when they do not originate from a model tool call.
+- Ordinary audio files stay ordinary attachments; only explicit voice-note directives create native voice bubbles.
+- Attachment captions now respect Fluxer's UTF-16 message limit and are included in exact delivery readback.
+- If an attachment fails after accompanying text was posted, Hermes removes the partial send before reporting a retryable failure. If cleanup itself fails, it reports partial success instead of encouraging a duplicate retry.
+- Older Hermes hosts that cannot pass normalized plugin-send context now fall back safely instead of enabling an incompatible full-request handler.
+
+### Verification
+
+- Host-contract and plugin regressions cover CLI/cron sends without model arguments, normalized thread/media forwarding, legacy handler compatibility, audio-vs-voice routing, partial-delivery cleanup, UTF-16 captions, and caption readback.
+
+
 ## [0.3.2] - 2026-08-30
 
 ### Fixed
