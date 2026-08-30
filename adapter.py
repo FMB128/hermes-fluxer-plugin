@@ -120,7 +120,7 @@ def _fluxer_env(name: str, default: Any = None) -> Any:
     return get_secret(name, default)
 
 
-def _voice_child_process_env() -> Dict[str, str]:
+def _voice_child_process_env() -> dict[str, str]:
     """Build the trusted voice sidecar env without cross-profile secrets."""
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
@@ -2014,10 +2014,10 @@ class FluxerAdapter(BasePlatformAdapter):
     @staticmethod
     def _rate_limit_delay(response: Any, attempt: int) -> float:
         """Resolve Fluxer's 429 retry window from headers or JSON body."""
-        candidates: List[Any] = [response.headers.get("Retry-After")]
+        candidates: list[Any] = [response.headers.get("Retry-After")]
         try:
             body = response.json()
-        except Exception:
+        except ValueError:
             body = None
         if isinstance(body, dict):
             candidates.extend((body.get("retry_after"), body.get("retryAfter")))
@@ -2044,14 +2044,15 @@ class FluxerAdapter(BasePlatformAdapter):
                 if response.status_code != 429 or attempt + 1 >= _REST_RATE_LIMIT_MAX_ATTEMPTS:
                     break
                 delay = self._rate_limit_delay(response, attempt)
-                logger.info("Fluxer REST %s %s rate limited; retrying in %.3fs", method, path, delay)
+                # Paths can contain deployment-specific identifiers. Keep them out
+                # of logs just as we keep the Authorization header out of logs.
+                logger.info("Fluxer REST %s rate limited; retrying in %.3fs", method, delay)
                 await asyncio.sleep(delay)
             assert response is not None
             if response.status_code >= 400 and warn_on_error:
                 logger.warning(
-                    "Fluxer REST %s %s failed: status=%s body=%s",
+                    "Fluxer REST %s failed: status=%s body=%s",
                     method,
-                    path,
                     response.status_code,
                     _redact_fluxer_error_body(response.text, self.bot_token),
                 )
@@ -2251,7 +2252,7 @@ class FluxerAdapter(BasePlatformAdapter):
         if chat_type == "dm":
             return True, text
         if self._allowed_channel_ids and channel_id not in self._allowed_channel_ids:
-            logger.debug("Fluxer ignoring message in non-allowed channel %s", channel_id)
+            logger.debug("Fluxer ignoring message in a channel outside the allowed set")
             return False, text
         if channel_id in self._free_response_channels or channel_id in self._home_channel_ids:
             return True, text
@@ -2312,11 +2313,13 @@ class FluxerAdapter(BasePlatformAdapter):
                     )
                     recovered += 1
                 if recovered:
-                    logger.info("Fluxer recovered %d backlog message(s) for channel %s", recovered, channel_id)
+                    logger.info("Fluxer recovered %d backlog message(s)", recovered)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("Fluxer backlog recovery failed for channel %s: %s", channel_id, exc)
+                # HTTP exception strings can include request URLs or headers. The
+                # exception class supplies useful context without exposing either.
+                logger.warning("Fluxer backlog recovery failed (%s)", type(exc).__name__)
 
     async def _listen_loop(self) -> None:
         assert self._ws is not None

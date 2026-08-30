@@ -1688,6 +1688,46 @@ async def test_rest_request_retries_fluxer_429_using_retry_after(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_rest_request_logs_do_not_expose_paths_or_tokens(monkeypatch, caplog):
+    import httpx
+
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    request = httpx.Request("POST", "https://api.fluxer.app/v1/channels/private-route/messages")
+    responses = [
+        httpx.Response(429, headers={"Retry-After": "0"}, request=request),
+        httpx.Response(400, text='{"token":"app.secret"}', request=request),
+    ]
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def request(self, *args, **kwargs):
+            response = responses[self.calls]
+            self.calls += 1
+            return response
+
+    client = FakeClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client)
+    monkeypatch.setattr(fluxer_adapter.asyncio, "sleep", AsyncMock())
+    caplog.set_level("INFO")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await adapter._request("POST", "/channels/private-route/messages", json={"content": "hello"})
+
+    assert "private-route" not in caplog.text
+    assert "app.secret" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_multipart_retry_rewinds_file_handles(monkeypatch, tmp_path):
     import httpx
 

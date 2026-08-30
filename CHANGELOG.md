@@ -18,6 +18,7 @@ This project uses simple semantic versioning while the plugin is young:
 - Isolated realtime voice child processes from inherited primary-profile Fluxer settings, including bot credentials and access policy.
 - Added bounded retries for Fluxer REST `429` responses. The adapter honors `Retry-After` or Fluxer's JSON `retry_after`, and rewinds multipart files before retrying uploads.
 - Applied mention safety before Fluxer's 4,000 UTF-16-unit limit, preventing neutralized mentions from making a boundary-length send or edit too large.
+- Kept request paths, channel identifiers, and HTTP exception details out of operational logs so sensitive deployment information cannot be exposed during retries or backlog recovery.
 
 ### Compatibility review
 
@@ -27,7 +28,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Verification
 
-- `PYTHONPATH=<current-hermes-origin-main>:. pytest -q` → 209 passed.
+- `PYTHONPATH=<current-hermes-origin-main>:. pytest -q` → 210 passed.
 - `python -m py_compile adapter.py __init__.py livekit_bridge.py xai_realtime.py scripts/*.py tools/*.py` → clean.
 
 ## [0.2.5] - 2026-08-12
