@@ -12,6 +12,7 @@ from enum import Enum
 from pathlib import Path
 import atexit
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -94,6 +95,42 @@ except ModuleNotFoundError:
             if not path.exists():
                 raise FileNotFoundError(file_path)
             return path
+
+        @staticmethod
+        def extract_media(content: str) -> tuple[list[tuple[str, bool]], str]:
+            """Standalone-test subset of Hermes' MEDIA directive contract."""
+            has_voice_tag = "[[audio_as_voice]]" in content
+            cleaned = content.replace("[[audio_as_voice]]", "").replace(
+                "[[as_document]]", ""
+            )
+            media: list[tuple[str, bool]] = []
+            matched = False
+            for match in re.finditer(r"MEDIA:(?P<path>\S+)", cleaned):
+                matched = True
+                media_path = os.path.expanduser(match.group("path"))
+                is_voice = has_voice_tag and Path(media_path).suffix.lower() in {
+                    ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac", ".aac"
+                }
+                media.append((media_path, is_voice))
+            cleaned = re.sub(r"MEDIA:\S+", "", cleaned)
+            if matched or cleaned != content:
+                cleaned = "\n".join(
+                    line.strip() for line in cleaned.splitlines() if line.strip()
+                )
+            return media, cleaned
+
+        @staticmethod
+        def filter_media_delivery_paths(
+            media_files: list[tuple[str, bool]] | None,
+            session_key: str = "",
+        ) -> list[tuple[str, bool]]:
+            del session_key
+            safe_media: list[tuple[str, bool]] = []
+            for media_path, is_voice in media_files or []:
+                path = Path(media_path)
+                if path.exists() and path.is_file():
+                    safe_media.append((str(path.resolve()), bool(is_voice)))
+            return safe_media
 
         @staticmethod
         def truncate_message(
