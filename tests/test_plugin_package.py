@@ -184,6 +184,148 @@ def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):
     assert os.environ["FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY"] == "false"
 
 
+def test_check_requirements_is_a_passive_dependency_probe(monkeypatch):
+    monkeypatch.delenv("FLUXER_BOT_TOKEN", raising=False)
+
+    assert fluxer_adapter.check_requirements() is True
+
+
+def test_profile_scoped_yaml_config_stays_in_platform_extras(monkeypatch):
+    for key in (
+        "FLUXER_BOT_TOKEN",
+        "FLUXER_HOME_CHANNEL",
+        "FLUXER_HOME_GUILDS",
+        "FLUXER_ALLOWED_USERS",
+        "FLUXER_VOICE_ENABLED",
+        "FLUXER_VOICE_CHANNEL_IDS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(fluxer_adapter, "_profile_scoped_config_load", lambda: True)
+
+    extra = fluxer_adapter._apply_yaml_config(
+        {},
+        {
+            "bot_token": "profile-token",
+            "allowed_users": ["user-1"],
+            "home_channel": "channel-1",
+            "home_channel_name": "Home",
+            "home_guilds": ["guild-1"],
+            "voice": {"enabled": True, "channel_ids": ["voice-1"]},
+        },
+    )
+
+    assert extra == {
+        "bot_token": "profile-token",
+        "allowed_users": ["user-1"],
+        "allow_from": ["user-1"],
+        "group_allow_from": ["user-1"],
+        "home_channel": {"chat_id": "channel-1", "name": "Home"},
+        "home_channel_name": "Home",
+        "home_guilds": ["guild-1"],
+        "home_guild_ids": ["guild-1"],
+        "voice": {"enabled": True, "channel_ids": ["voice-1"]},
+    }
+    assert not any(key in os.environ for key in (
+        "FLUXER_BOT_TOKEN",
+        "FLUXER_HOME_CHANNEL",
+        "FLUXER_HOME_GUILDS",
+        "FLUXER_ALLOWED_USERS",
+        "FLUXER_VOICE_ENABLED",
+        "FLUXER_VOICE_CHANNEL_IDS",
+    ))
+
+    adapter = fluxer_adapter.FluxerAdapter(PlatformConfig(enabled=True, extra=extra))
+    assert adapter.bot_token == "profile-token"
+    assert adapter._allowed_user_ids == {"user-1"}
+    assert adapter._home_channel_ids == {"channel-1"}
+    assert adapter._home_guild_ids == {"guild-1"}
+    assert adapter._voice_supervisor.enabled is True
+    assert adapter._voice_supervisor.configured_channel_ids == "voice-1"
+
+
+def test_multiplex_yaml_without_active_scope_never_mutates_process_env(monkeypatch):
+    secret_scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.delenv("FLUXER_BOT_TOKEN", raising=False)
+    secret_scope.set_multiplex_active(True)
+    try:
+        seed = fluxer_adapter._apply_yaml_config(
+            {},
+            {"bot_token": "profile-token", "allowed_users": "profile-user"},
+        )
+        open_seed = fluxer_adapter._apply_yaml_config(
+            {},
+            {"bot_token": "profile-token", "allow_all_users": True},
+        )
+    finally:
+        secret_scope.set_multiplex_active(False)
+
+    assert "FLUXER_BOT_TOKEN" not in os.environ
+    assert seed is not None
+    assert seed["bot_token"] == "profile-token"
+    assert seed["allowed_users"] == "profile-user"
+    assert seed["allow_from"] == "profile-user"
+    assert seed["group_allow_from"] == "profile-user"
+    assert open_seed is not None
+    assert open_seed["allow_from"] == ["*"]
+    assert open_seed["group_allow_from"] == ["*"]
+
+
+def test_multiplexed_adapter_reads_active_profile_scope_not_process_env(monkeypatch):
+    secret_scope = pytest.importorskip("agent.secret_scope")
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "primary-token")
+    monkeypatch.setenv("FLUXER_ALLOWED_USERS", "primary-user")
+    monkeypatch.setenv("XAI_API_KEY", "primary-xai")
+    secret_scope.set_multiplex_active(True)
+    scope_marker = secret_scope.set_secret_scope(
+        {
+            "FLUXER_BOT_TOKEN": "secondary-token",
+            "FLUXER_ALLOWED_USERS": "secondary-user",
+            "XAI_API_KEY": "secondary-xai",
+        }
+    )
+    try:
+        adapter = fluxer_adapter.FluxerAdapter(PlatformConfig(enabled=True, extra={}))
+        child_env = adapter._voice_supervisor._child_env()
+    finally:
+        secret_scope.reset_secret_scope(scope_marker)
+        secret_scope.set_multiplex_active(False)
+
+    assert adapter.bot_token == "secondary-token"
+    assert adapter._allowed_user_ids == {"secondary-user"}
+    assert child_env["FLUXER_BOT_TOKEN"] == "secondary-token"
+    assert child_env["XAI_API_KEY"] == "secondary-xai"
+
+
+def test_multiplexed_voice_child_env_drops_primary_fluxer_values_and_uses_profile_extras(monkeypatch):
+    secret_scope = pytest.importorskip("agent.secret_scope")
+
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "primary-token")
+    monkeypatch.setenv("FLUXER_BASE_URL", "https://primary.example/api")
+    monkeypatch.setenv("FLUXER_ALLOW_ALL_USERS", "true")
+    secret_scope.set_multiplex_active(True)
+    scope_marker = secret_scope.set_secret_scope({"XAI_API_KEY": "secondary-xai"})
+    try:
+        supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(
+            extra={
+                "bot_token": "secondary-token",
+                "base_url": "https://secondary.example/api",
+                "allowed_users": "secondary-user",
+                "allow_all_users": False,
+            }
+        )
+        child_env = supervisor._child_env()
+    finally:
+        secret_scope.reset_secret_scope(scope_marker)
+        secret_scope.set_multiplex_active(False)
+
+    assert child_env["FLUXER_BOT_TOKEN"] == "secondary-token"
+    assert child_env["FLUXER_BASE_URL"] == "https://secondary.example/api"
+    assert child_env["FLUXER_ALLOWED_USERS"] == "secondary-user"
+    assert child_env["FLUXER_ALLOW_ALL_USERS"] == "false"
+    assert child_env["XAI_API_KEY"] == "secondary-xai"
+
+
 def test_voice_supervisor_treats_null_yaml_channel_ids_as_unscoped(monkeypatch):
     monkeypatch.delenv("FLUXER_VOICE_CHANNEL_IDS", raising=False)
     supervisor = fluxer_adapter.FluxerVoiceSupervisorProcess(
@@ -1205,6 +1347,128 @@ def test_zero_duration_attachment_without_waveform_is_not_voice_message():
     assert fluxer_adapter._is_voice_message(data) is False
 
 
+def test_fluxer_advertises_native_long_message_chunking():
+    assert fluxer_adapter.FluxerAdapter.splits_long_messages is True
+
+
+@pytest.mark.asyncio
+async def test_long_cron_report_chunks_below_fluxer_utf16_limit(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "delivery_verification": False,
+            },
+        )
+    )
+    adapter._request = AsyncMock(side_effect=[{"id": "chunk-1"}, {"id": "chunk-2"}])
+    report = ("Monday infra line 😀\n" * 300).strip()
+
+    result = await adapter.send("chan-1", report)
+    payloads = [call.kwargs["json"]["content"] for call in adapter._request.await_args_list]
+
+    assert result.success is True
+    assert len(payloads) == 2
+    assert all(len(chunk.encode("utf-16-le")) // 2 <= fluxer_adapter.MAX_MESSAGE_LENGTH for chunk in payloads)
+
+
+@pytest.mark.asyncio
+async def test_send_sanitizes_mentions_before_utf16_chunking(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_MENTION_EVERYONE", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "allow_mention_everyone": False,
+                "delivery_verification": False,
+            },
+        )
+    )
+    adapter._request = AsyncMock(side_effect=[{"id": "chunk-1"}, {"id": "chunk-2"}])
+
+    result = await adapter.send("chan-1", ("x" * 3991) + "@everyone")
+    payloads = [call.kwargs["json"]["content"] for call in adapter._request.await_args_list]
+
+    assert result.success is True
+    assert len(payloads) == 2
+    assert all(fluxer_adapter.utf16_len(chunk) <= fluxer_adapter.MAX_MESSAGE_LENGTH for chunk in payloads)
+
+
+@pytest.mark.asyncio
+async def test_edit_sanitizes_mentions_before_utf16_truncation(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_MENTION_EVERYONE", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "allow_mention_everyone": False,
+                "delivery_verification": False,
+            },
+        )
+    )
+    adapter._request = AsyncMock(return_value={"id": "msg-edit"})
+
+    result = await adapter.edit_message(
+        "chan-1",
+        "msg-edit",
+        ("x" * 3991) + "@everyone",
+        finalize=True,
+    )
+    payload = adapter._request.await_args.kwargs["json"]["content"]
+
+    assert result.success is True
+    assert fluxer_adapter.utf16_len(payload) <= fluxer_adapter.MAX_MESSAGE_LENGTH
+
+
+@pytest.mark.asyncio
+async def test_intermediate_stream_edit_does_not_exact_verify_racy_content(monkeypatch):
+    """A newer stream edit can win before GET read-back, so only final content is exact-checked."""
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    adapter._request = AsyncMock(return_value={"id": "msg-stream"})
+    adapter._verify_delivery = AsyncMock(return_value={"id": "msg-stream", "content": "newer chunk"})
+
+    result = await adapter.edit_message("chan-1", "msg-stream", "older chunk", finalize=False)
+
+    assert result.success is True
+    adapter._verify_delivery.assert_awaited_once_with(
+        "chan-1",
+        "msg-stream",
+        expected_content=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_stream_edit_exact_verifies_visible_content(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_ALLOWED_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    adapter._request = AsyncMock(return_value={"id": "msg-stream"})
+    adapter._verify_delivery = AsyncMock(return_value={"id": "msg-stream", "content": "final answer"})
+
+    result = await adapter.edit_message("chan-1", "msg-stream", "final answer", finalize=True)
+
+    assert result.success is True
+    adapter._verify_delivery.assert_awaited_once_with(
+        "chan-1",
+        "msg-stream",
+        expected_content="final answer",
+    )
+
+
 @pytest.mark.asyncio
 async def test_send_voice_uploads_fluxer_voice_message_payload(monkeypatch, tmp_path):
     monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
@@ -1381,6 +1645,132 @@ async def test_gateway_ready_event_is_set_on_ready_dispatch(monkeypatch):
 
     assert adapter.bot_user_id == "bot-user"
     assert await adapter.wait_until_gateway_ready(timeout=0.001) is True
+
+
+@pytest.mark.asyncio
+async def test_rest_request_retries_fluxer_429_using_retry_after(monkeypatch):
+    import httpx
+
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    request = httpx.Request("POST", "https://api.fluxer.app/v1/channels/1/messages")
+    responses = [
+        httpx.Response(429, headers={"Retry-After": "0.25"}, json={"retry_after": 1}, request=request),
+        httpx.Response(200, json={"id": "message-1"}, request=request),
+    ]
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def request(self, *args, **kwargs):
+            response = responses[self.calls]
+            self.calls += 1
+            return response
+
+    client = FakeClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client)
+    sleep = AsyncMock()
+    monkeypatch.setattr(fluxer_adapter.asyncio, "sleep", sleep)
+
+    result = await adapter._request("POST", "/channels/1/messages", json={"content": "hello"})
+
+    assert result == {"id": "message-1"}
+    assert client.calls == 2
+    sleep.assert_awaited_once_with(0.25)
+
+
+@pytest.mark.asyncio
+async def test_rest_request_logs_do_not_expose_paths_or_tokens(monkeypatch, caplog):
+    import httpx
+
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    request = httpx.Request("POST", "https://api.fluxer.app/v1/channels/private-route/messages")
+    responses = [
+        httpx.Response(429, headers={"Retry-After": "0"}, request=request),
+        httpx.Response(400, text='{"token":"app.secret"}', request=request),
+    ]
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def request(self, *args, **kwargs):
+            response = responses[self.calls]
+            self.calls += 1
+            return response
+
+    client = FakeClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client)
+    monkeypatch.setattr(fluxer_adapter.asyncio, "sleep", AsyncMock())
+    caplog.set_level("INFO")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await adapter._request("POST", "/channels/private-route/messages", json={"content": "hello"})
+
+    assert "private-route" not in caplog.text
+    assert "app.secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_multipart_retry_rewinds_file_handles(monkeypatch, tmp_path):
+    import httpx
+
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "allow_all_users": True})
+    )
+    upload = tmp_path / "voice.ogg"
+    upload.write_bytes(b"audio-payload")
+    request = httpx.Request("POST", "https://api.fluxer.app/v1/channels/1/messages")
+    positions = []
+
+    class FakeClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def request(self, *args, **kwargs):
+            handle = kwargs["files"][0][1][1]
+            positions.append(handle.tell())
+            handle.read()
+            self.calls += 1
+            if self.calls == 1:
+                return httpx.Response(429, json={"retry_after": 0}, request=request)
+            return httpx.Response(200, json={"id": "message-2"}, request=request)
+
+    client = FakeClient()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client)
+    monkeypatch.setattr(fluxer_adapter.asyncio, "sleep", AsyncMock())
+
+    result = await adapter._multipart_request(
+        "POST",
+        "/channels/1/messages",
+        payload={"content": ""},
+        files=[("files[0]", upload, "voice.ogg")],
+    )
+
+    assert result == {"id": "message-2"}
+    assert positions == [0, 0]
 
 
 def test_xai_realtime_defaults_are_generic_and_concise():

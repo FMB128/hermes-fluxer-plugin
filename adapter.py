@@ -1,12 +1,7 @@
 """Fluxer platform plugin for Hermes Agent.
 
-Text-first adapter:
-- REST `POST /channels/:id/messages` for outbound messages.
-- Fluxer Gateway websocket `MESSAGE_CREATE` events for inbound messages.
-
-Fluxer self-hosting is still moving, so this adapter intentionally keeps the
-surface conservative and easy to test. Media/rich embeds can layer on once the
-API settles.
+REST + Gateway adapter for messages, media, interactions, reactions, threads,
+delivery recovery, and optional LiveKit voice.
 )"""
 
 from __future__ import annotations
@@ -26,7 +21,7 @@ import uuid
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 from urllib.parse import quote, urljoin, urlparse
 
 from gateway.config import Platform, PlatformConfig
@@ -40,6 +35,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_url,
     safe_url_for_log,
+    utf16_len,
 )
 
 
@@ -88,6 +84,8 @@ _VOICE_MESSAGE_FLAG = 1 << 13
 _RECONNECT_BASE_DELAY = 2.0
 _RECONNECT_MAX_DELAY = 60.0
 _HEARTBEAT_ACK_TIMEOUT_FACTOR = 2.5
+_REST_RATE_LIMIT_MAX_ATTEMPTS = 3
+_REST_RATE_LIMIT_MAX_DELAY = 60.0
 _DEFAULT_BACKLOG_LIMIT = 25
 _DEFAULT_BACKLOG_BOOTSTRAP_SECONDS = 120
 _MENTION_EVERYONE_RE = re.compile(r"@(everyone|here)\b", re.IGNORECASE)
@@ -106,6 +104,75 @@ _SLASH_CONFIRM_REACTIONS = (
     ("❌", "cancel", "cancel"),
 )
 _PLUGIN_ROOT = Path(__file__).resolve().parent
+
+
+def _fluxer_env(name: str, default: Any = None) -> Any:
+    """Read a Fluxer setting without crossing a Hermes profile boundary.
+
+    Newer Hermes releases keep each multiplexed profile's ``.env`` in a
+    context-local secret scope. Falling back to raw ``os.getenv`` is safe only
+    on older Hermes versions that do not provide that scope API.
+    """
+    try:
+        from agent.secret_scope import get_secret
+    except ImportError:
+        return os.getenv(name, default)
+    return get_secret(name, default)
+
+
+def _voice_child_process_env() -> dict[str, str]:
+    """Build the trusted voice sidecar env without cross-profile secrets."""
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+    except ImportError:
+        multiplexed = False
+        scope = None
+    else:
+        multiplexed = bool(is_multiplex_active())
+        scope = current_secret_scope() if multiplexed else None
+    if multiplexed and scope is None:
+        raise RuntimeError("Fluxer voice child environment requires an active Hermes profile scope")
+
+    try:
+        from tools.environments.local import build_subprocess_env
+
+        env = build_subprocess_env(scrub_secrets=True, inherit_profile_home=True)
+    except (ImportError, AttributeError, TypeError):
+        env = os.environ.copy()
+        if multiplexed:
+            sensitive_suffixes = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_CREDENTIAL")
+            for key in list(env):
+                if key.endswith(sensitive_suffixes):
+                    env.pop(key, None)
+
+    credential_keys = {
+        "XAI_API_KEY",
+        "GROQ_API_KEY",
+        "ELEVENLABS_API_KEY",
+        "API_SERVER_KEY",
+        "API_SERVER_MODEL_NAME",
+        "HERMES_LOCAL_STT_COMMAND",
+        "XAI_STT_BASE_URL",
+        "GROQ_BASE_URL",
+        "ELEVENLABS_STT_BASE_URL",
+    }
+    if multiplexed:
+        # Hermes' generic scrubber cannot know a plugin's full FLUXER_* surface.
+        # Remove every inherited Fluxer value before copying the active profile
+        # scope, otherwise a secondary voice sidecar can silently use the
+        # primary profile's bot token or access policy.
+        for key in list(env):
+            if key.startswith("FLUXER_"):
+                env.pop(key, None)
+    source: Mapping[str, Any] = scope if scope is not None else os.environ
+    for key, value in source.items():
+        if key.startswith("FLUXER_") or key in credential_keys:
+            env[key] = str(value)
+
+    profile_home = env.get("HERMES_HOME")
+    if profile_home:
+        env["HERMES_ENV_FILE"] = str(Path(profile_home) / ".env")
+    return env
 
 
 def _strip_slash(url: str) -> str:
@@ -411,7 +478,7 @@ def _voice_config_dict(extra: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _voice_setting(extra: Dict[str, Any], key: str, env_name: str, default: Any = None) -> Any:
-    env_value = os.getenv(env_name)
+    env_value = _fluxer_env(env_name)
     if env_value is not None:
         return env_value
     voice = _voice_config_dict(extra)
@@ -474,11 +541,11 @@ class FluxerVoiceSupervisorProcess:
         return not self.supervisor_disabled and self.enabled and self.auto_join and bool(self.configured_channel_ids)
 
     def build_command(self) -> list[str]:
-        python = os.getenv("FLUXER_VOICE_PYTHON", sys.executable)
+        python = _fluxer_env("FLUXER_VOICE_PYTHON", sys.executable)
         return [python, str(self.plugin_root / "scripts" / "fluxer_voice_auto_join.py")]
 
     def _child_env(self) -> Dict[str, str]:
-        env = os.environ.copy()
+        env = _voice_child_process_env()
         # Child scripts create their own FluxerAdapter instances to listen for
         # voice gateway events / perform the LiveKit handshake. Those internal
         # adapters must not start another plugin-managed supervisor from their
@@ -489,9 +556,31 @@ class FluxerVoiceSupervisorProcess:
             "bot_token": "FLUXER_BOT_TOKEN",
             "base_url": "FLUXER_BASE_URL",
             "gateway_url": "FLUXER_GATEWAY_URL",
+            "allowed_users": "FLUXER_ALLOWED_USERS",
+            "allow_all_users": "FLUXER_ALLOW_ALL_USERS",
+            "backlog_recovery": "FLUXER_BACKLOG_RECOVERY",
+            "backlog_limit": "FLUXER_BACKLOG_LIMIT",
+            "backlog_bootstrap_seconds": "FLUXER_BACKLOG_BOOTSTRAP_SECONDS",
+            "require_mention": "FLUXER_REQUIRE_MENTION",
+            "strict_mention": "FLUXER_STRICT_MENTION",
+            "free_response_channels": "FLUXER_FREE_RESPONSE_CHANNELS",
+            "home_guild_id": "FLUXER_HOME_GUILD_ID",
+            "home_guilds": "FLUXER_HOME_GUILDS",
+            "auto_free_response_home_guild": "FLUXER_AUTO_FREE_RESPONSE_HOME_GUILD",
+            "mention_gated_channels": "FLUXER_MENTION_GATED_CHANNELS",
+            "allowed_channels": "FLUXER_ALLOWED_CHANNELS",
+            "mention_patterns": "FLUXER_MENTION_PATTERNS",
+            "allow_mention_everyone": "FLUXER_ALLOW_MENTION_EVERYONE",
+            "allow_mention_roles": "FLUXER_ALLOW_MENTION_ROLES",
+            "allow_mention_users": "FLUXER_ALLOW_MENTION_USERS",
+            "allow_mention_replied_user": "FLUXER_ALLOW_MENTION_REPLIED_USER",
+            "delivery_verification": "FLUXER_DELIVERY_VERIFICATION",
+            "application_id": "FLUXER_APPLICATION_ID",
         }.items():
-            if env_name not in env and self.extra.get(extra_key):
-                env[env_name] = str(self.extra[extra_key]).strip()
+            if env_name not in env and extra_key in self.extra:
+                value = self.extra.get(extra_key)
+                if value is not None:
+                    env[env_name] = _coerce_env_value(value).strip()
         voice = _voice_config_dict(self.extra)
         mappings = {
             "enabled": "FLUXER_VOICE_ENABLED",
@@ -876,6 +965,11 @@ class FluxerAdapter(BasePlatformAdapter):
     # Hermes gateway uses this capability flag to display terminal tool commands
     # as clean fenced blocks in editable tool-progress messages.
     supports_code_blocks = True
+    # send() chunks with BasePlatformAdapter.truncate_message(). Advertising
+    # this keeps cron delivery from pre-truncating a multi-message report into a
+    # single 4,000-codepoint payload. That old path could still exceed Fluxer's
+    # 4,000 UTF-16-unit API limit when it contained astral emoji.
+    splits_long_messages = True
 
     def __init__(self, config: PlatformConfig):
         _ensure_fluxer_platform_registered()
@@ -883,90 +977,90 @@ class FluxerAdapter(BasePlatformAdapter):
         extra = getattr(config, "extra", {}) or {}
         self._gateway_state_updates_enabled = _coerce_bool(extra.get("gateway_state_updates"), True)
         self.base_url = _strip_slash(
-            os.getenv("FLUXER_BASE_URL") or extra.get("base_url") or _DEFAULT_BASE_URL
+            _fluxer_env("FLUXER_BASE_URL") or extra.get("base_url") or _DEFAULT_BASE_URL
         )
         self.api_base_url = _api_base(self.base_url)
         self.bot_token = (
-            os.getenv("FLUXER_BOT_TOKEN") or extra.get("bot_token") or ""
+            _fluxer_env("FLUXER_BOT_TOKEN") or extra.get("bot_token") or ""
         ).strip()
         self.gateway_url = _strip_slash(
-            os.getenv("FLUXER_GATEWAY_URL") or extra.get("gateway_url") or ""
+            _fluxer_env("FLUXER_GATEWAY_URL") or extra.get("gateway_url") or ""
         )
         self.bot_user_id: Optional[str] = str(extra.get("bot_user_id")) if extra.get("bot_user_id") else None
-        self._allowed_user_ids = _split_ids(os.getenv("FLUXER_ALLOWED_USERS") or extra.get("allowed_users"))
-        self._allow_all_users = _coerce_bool(os.getenv("FLUXER_ALLOW_ALL_USERS", extra.get("allow_all_users")), False)
+        self._allowed_user_ids = _split_ids(_fluxer_env("FLUXER_ALLOWED_USERS") or extra.get("allowed_users"))
+        self._allow_all_users = _coerce_bool(_fluxer_env("FLUXER_ALLOW_ALL_USERS", extra.get("allow_all_users")), False)
         self._backlog_enabled = str(
-            os.getenv("FLUXER_BACKLOG_RECOVERY", extra.get("backlog_recovery", "true"))
+            _fluxer_env("FLUXER_BACKLOG_RECOVERY", extra.get("backlog_recovery", "true"))
         ).strip().lower() not in {"0", "false", "no", "off"}
         self._backlog_limit = min(
-            _coerce_int(os.getenv("FLUXER_BACKLOG_LIMIT") or extra.get("backlog_limit"), _DEFAULT_BACKLOG_LIMIT),
+            _coerce_int(_fluxer_env("FLUXER_BACKLOG_LIMIT") or extra.get("backlog_limit"), _DEFAULT_BACKLOG_LIMIT),
             100,
         )
         self._backlog_bootstrap_seconds = min(
             _coerce_int(
-                os.getenv("FLUXER_BACKLOG_BOOTSTRAP_SECONDS") or extra.get("backlog_bootstrap_seconds"),
+                _fluxer_env("FLUXER_BACKLOG_BOOTSTRAP_SECONDS") or extra.get("backlog_bootstrap_seconds"),
                 _DEFAULT_BACKLOG_BOOTSTRAP_SECONDS,
             ),
             900,
         )
         self._delivery_verification_enabled = str(
-            os.getenv("FLUXER_DELIVERY_VERIFICATION", extra.get("delivery_verification", "true"))
+            _fluxer_env("FLUXER_DELIVERY_VERIFICATION", extra.get("delivery_verification", "true"))
         ).strip().lower() not in {"0", "false", "no", "off"}
         self._allow_mention_everyone = _coerce_bool(
-            os.getenv("FLUXER_ALLOW_MENTION_EVERYONE", extra.get("allow_mention_everyone")),
+            _fluxer_env("FLUXER_ALLOW_MENTION_EVERYONE", extra.get("allow_mention_everyone")),
             False,
         )
         self._allow_mention_roles = _coerce_bool(
-            os.getenv("FLUXER_ALLOW_MENTION_ROLES", extra.get("allow_mention_roles")),
+            _fluxer_env("FLUXER_ALLOW_MENTION_ROLES", extra.get("allow_mention_roles")),
             False,
         )
         self._allow_mention_users = _coerce_bool(
-            os.getenv("FLUXER_ALLOW_MENTION_USERS", extra.get("allow_mention_users")),
+            _fluxer_env("FLUXER_ALLOW_MENTION_USERS", extra.get("allow_mention_users")),
             True,
         )
         self._allow_mention_replied_user = _coerce_bool(
-            os.getenv("FLUXER_ALLOW_MENTION_REPLIED_USER", extra.get("allow_mention_replied_user")),
+            _fluxer_env("FLUXER_ALLOW_MENTION_REPLIED_USER", extra.get("allow_mention_replied_user")),
             True,
         )
         self._require_mention = _coerce_bool(
-            os.getenv("FLUXER_REQUIRE_MENTION", extra.get("require_mention")),
+            _fluxer_env("FLUXER_REQUIRE_MENTION", extra.get("require_mention")),
             True,
         )
         self._strict_mention = _coerce_bool(
-            os.getenv("FLUXER_STRICT_MENTION", extra.get("strict_mention")),
+            _fluxer_env("FLUXER_STRICT_MENTION", extra.get("strict_mention")),
             False,
         )
         self._free_response_channels = _split_ids(
-            os.getenv("FLUXER_FREE_RESPONSE_CHANNELS") or extra.get("free_response_channels")
+            _fluxer_env("FLUXER_FREE_RESPONSE_CHANNELS") or extra.get("free_response_channels")
         )
         self._mention_gated_channels = _split_ids(
-            os.getenv("FLUXER_MENTION_GATED_CHANNELS") or extra.get("mention_gated_channels")
+            _fluxer_env("FLUXER_MENTION_GATED_CHANNELS") or extra.get("mention_gated_channels")
         )
         self._auto_free_response_home_guild = _coerce_bool(
-            os.getenv("FLUXER_AUTO_FREE_RESPONSE_HOME_GUILD", extra.get("auto_free_response_home_guild")),
+            _fluxer_env("FLUXER_AUTO_FREE_RESPONSE_HOME_GUILD", extra.get("auto_free_response_home_guild")),
             False,
         )
         self._home_guild_ids = _split_ids(
-            os.getenv("FLUXER_HOME_GUILDS")
-            or os.getenv("FLUXER_HOME_GUILD_ID")
+            _fluxer_env("FLUXER_HOME_GUILDS")
+            or _fluxer_env("FLUXER_HOME_GUILD_ID")
             or extra.get("home_guild_ids")
             or extra.get("home_guild_id")
         )
         self._allowed_channel_ids = _split_ids(
-            os.getenv("FLUXER_ALLOWED_CHANNELS") or extra.get("allowed_channels")
+            _fluxer_env("FLUXER_ALLOWED_CHANNELS") or extra.get("allowed_channels")
         )
         self._mention_patterns = tuple(
             part.strip()
-            for part in _split_ids(os.getenv("FLUXER_MENTION_PATTERNS") or extra.get("mention_patterns"))
+            for part in _split_ids(_fluxer_env("FLUXER_MENTION_PATTERNS") or extra.get("mention_patterns"))
             if part.strip()
         )
         self._register_native_commands_on_connect = _coerce_bool(
-            os.getenv("FLUXER_REGISTER_NATIVE_COMMANDS", extra.get("register_native_commands")),
+            _fluxer_env("FLUXER_REGISTER_NATIVE_COMMANDS", extra.get("register_native_commands")),
             False,
         )
-        self._application_id = str(os.getenv("FLUXER_APPLICATION_ID") or extra.get("application_id") or "").strip()
+        self._application_id = str(_fluxer_env("FLUXER_APPLICATION_ID") or extra.get("application_id") or "").strip()
         self._native_command_guild_ids = _split_ids(
-            os.getenv("FLUXER_NATIVE_COMMAND_GUILDS") or extra.get("native_command_guilds")
+            _fluxer_env("FLUXER_NATIVE_COMMAND_GUILDS") or extra.get("native_command_guilds")
         )
         self._mentioned_threads: OrderedDict[str, None] = OrderedDict()
         self._mentioned_threads_max = 5000
@@ -980,7 +1074,7 @@ class FluxerAdapter(BasePlatformAdapter):
         if isinstance(home_extra, dict) and home_extra.get("chat_id"):
             self._home_channel_ids.add(str(home_extra["chat_id"]))
             self._known_channel_ids.add(str(home_extra["chat_id"]))
-        home_env = os.getenv("FLUXER_HOME_CHANNEL", "").strip()
+        home_env = _fluxer_env("FLUXER_HOME_CHANNEL", "").strip()
         if home_env:
             self._home_channel_ids.add(home_env)
             self._known_channel_ids.add(home_env)
@@ -1182,8 +1276,11 @@ class FluxerAdapter(BasePlatformAdapter):
         self._known_channel_ids.add(str(chat_id))
 
         try:
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH)
+            # Mention neutralization inserts zero-width characters. Apply it
+            # before measuring so the final wire payload cannot cross Fluxer's
+            # 4,000 UTF-16-unit limit after sanitization.
+            formatted = self._sanitize_outbound_mentions(self.format_message(content))
+            chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH, len_fn=utf16_len)
             message_ids: List[str] = []
             responses: List[Dict[str, Any]] = []
 
@@ -1370,18 +1467,32 @@ class FluxerAdapter(BasePlatformAdapter):
         callbacks.
         """
         try:
-            formatted = self.format_message(content)
-            if len(formatted) > MAX_MESSAGE_LENGTH:
-                formatted = formatted[: MAX_MESSAGE_LENGTH - 3] + "..."
+            # Sanitize before measuring: neutralized mentions are one UTF-16
+            # unit longer than their source syntax.
+            formatted = self._sanitize_outbound_mentions(self.format_message(content))
+            if utf16_len(formatted) > MAX_MESSAGE_LENGTH:
+                # Reuse the platform splitter's UTF-16 accounting so an emoji
+                # cannot make an apparently 4,000-character edit exceed the API
+                # limit. Keep the edit to one self-contained first chunk.
+                formatted = self.truncate_message(
+                    formatted,
+                    MAX_MESSAGE_LENGTH,
+                    len_fn=utf16_len,
+                )[0]
             data = await self._request(
                 "PATCH",
                 f"/channels/{_quote_id(chat_id)}/messages/{_quote_id(message_id)}",
                 json=self._outbound_message_payload(formatted),
             )
+            # Intermediate streaming edits are intentionally not content-checked:
+            # a later PATCH can land before this edit's GET read-back, making the
+            # read-back newer than ``formatted`` and producing a false mismatch.
+            # The final edit is stable and still gets exact visible-content
+            # verification; intermediate edits retain ID/author verification.
             verified = await self._verify_delivery(
                 chat_id,
                 str(data.get("id") or message_id),
-                expected_content=self._sanitize_outbound_mentions(formatted),
+                expected_content=(self._sanitize_outbound_mentions(formatted) if finalize else None),
             )
             raw_response = dict(data)
             raw_response["delivery_verified"] = verified is not None
@@ -1900,6 +2011,25 @@ class FluxerAdapter(BasePlatformAdapter):
             )
             return data, False
 
+    @staticmethod
+    def _rate_limit_delay(response: Any, attempt: int) -> float:
+        """Resolve Fluxer's 429 retry window from headers or JSON body."""
+        candidates: list[Any] = [response.headers.get("Retry-After")]
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            candidates.extend((body.get("retry_after"), body.get("retryAfter")))
+        for candidate in candidates:
+            try:
+                value = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if value >= 0:
+                return min(_REST_RATE_LIMIT_MAX_DELAY, max(0.05, value))
+        return min(_REST_RATE_LIMIT_MAX_DELAY, float(2**attempt))
+
     async def _request(self, method: str, path: str, *, warn_on_error: bool = True, **kwargs) -> Dict[str, Any]:
         try:
             import httpx
@@ -1908,12 +2038,21 @@ class FluxerAdapter(BasePlatformAdapter):
 
         url = urljoin(self.api_base_url + "/", path.lstrip("/"))
         async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.request(method, url, headers=_headers(self.bot_token), **kwargs)
+            response = None
+            for attempt in range(_REST_RATE_LIMIT_MAX_ATTEMPTS):
+                response = await client.request(method, url, headers=_headers(self.bot_token), **kwargs)
+                if response.status_code != 429 or attempt + 1 >= _REST_RATE_LIMIT_MAX_ATTEMPTS:
+                    break
+                delay = self._rate_limit_delay(response, attempt)
+                # Paths can contain deployment-specific identifiers. Keep them out
+                # of logs just as we keep the Authorization header out of logs.
+                logger.info("Fluxer REST %s rate limited; retrying in %.3fs", method, delay)
+                await asyncio.sleep(delay)
+            assert response is not None
             if response.status_code >= 400 and warn_on_error:
                 logger.warning(
-                    "Fluxer REST %s %s failed: status=%s body=%s",
+                    "Fluxer REST %s failed: status=%s body=%s",
                     method,
-                    path,
                     response.status_code,
                     _redact_fluxer_error_body(response.text, self.bot_token),
                 )
@@ -1946,13 +2085,24 @@ class FluxerAdapter(BasePlatformAdapter):
                 multipart_files.append((field_name, (filename, handle, content_type)))
             data = {"payload_json": json.dumps(payload, separators=(",", ":"))}
             async with httpx.AsyncClient(timeout=60) as client:
-                response = await client.request(
-                    method,
-                    url,
-                    headers=_auth_headers(self.bot_token),
-                    data=data,
-                    files=multipart_files,
-                )
+                response = None
+                for attempt in range(_REST_RATE_LIMIT_MAX_ATTEMPTS):
+                    if attempt:
+                        for handle in handles:
+                            handle.seek(0)
+                    response = await client.request(
+                        method,
+                        url,
+                        headers=_auth_headers(self.bot_token),
+                        data=data,
+                        files=multipart_files,
+                    )
+                    if response.status_code != 429 or attempt + 1 >= _REST_RATE_LIMIT_MAX_ATTEMPTS:
+                        break
+                    delay = self._rate_limit_delay(response, attempt)
+                    logger.info("Fluxer REST %s %s rate limited; retrying upload in %.3fs", method, path, delay)
+                    await asyncio.sleep(delay)
+                assert response is not None
                 response.raise_for_status()
                 if not response.content:
                     return {}
@@ -2102,7 +2252,7 @@ class FluxerAdapter(BasePlatformAdapter):
         if chat_type == "dm":
             return True, text
         if self._allowed_channel_ids and channel_id not in self._allowed_channel_ids:
-            logger.debug("Fluxer ignoring message in non-allowed channel %s", channel_id)
+            logger.debug("Fluxer ignoring message in a channel outside the allowed set")
             return False, text
         if channel_id in self._free_response_channels or channel_id in self._home_channel_ids:
             return True, text
@@ -2163,11 +2313,13 @@ class FluxerAdapter(BasePlatformAdapter):
                     )
                     recovered += 1
                 if recovered:
-                    logger.info("Fluxer recovered %d backlog message(s) for channel %s", recovered, channel_id)
+                    logger.info("Fluxer recovered %d backlog message(s)", recovered)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("Fluxer backlog recovery failed for channel %s: %s", channel_id, exc)
+                # HTTP exception strings can include request URLs or headers. The
+                # exception class supplies useful context without exposing either.
+                logger.warning("Fluxer backlog recovery failed (%s)", type(exc).__name__)
 
     async def _listen_loop(self) -> None:
         assert self._ws is not None
@@ -2725,8 +2877,13 @@ class FluxerAdapter(BasePlatformAdapter):
 
 
 def check_requirements() -> bool:
-    if not os.getenv("FLUXER_BOT_TOKEN"):
-        return False
+    """Passively report whether the adapter dependencies are importable.
+
+    Hermes calls the platform registry ``check_fn`` while loading status and
+    profile-scoped configuration.  Credentials belong to ``validate_config``;
+    requiring a process-global token here incorrectly disables profiles whose
+    token lives only in ``PlatformConfig.extra``.
+    """
     try:
         import httpx  # noqa: F401
         import websockets  # noqa: F401
@@ -2737,7 +2894,7 @@ def check_requirements() -> bool:
 
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
-    token = os.getenv("FLUXER_BOT_TOKEN") or extra.get("bot_token", "")
+    token = _fluxer_env("FLUXER_BOT_TOKEN") or extra.get("bot_token", "")
     return bool(str(token).strip())
 
 
@@ -2761,6 +2918,20 @@ def _set_env_default(name: str, value: Any) -> None:
     os.environ[name] = _coerce_env_value(value)
 
 
+def _profile_scoped_config_load() -> bool:
+    """Return True while Hermes loads a multiplexed profile's configuration.
+
+    A secondary profile must not copy its Fluxer token or authorization policy
+    into process-global environment variables.  The values returned by
+    ``_apply_yaml_config`` remain scoped to that profile instead.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+    except ImportError:
+        return False
+    return bool(is_multiplex_active())
+
+
 def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
     """Bridge ``fluxer:`` config.yaml keys into env/default extras.
 
@@ -2770,6 +2941,31 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
     """
 
     cfg = platform_cfg if isinstance(platform_cfg, dict) else {}
+    scoped_load = _profile_scoped_config_load()
+
+    # Return adapter-consumable extras for every load.  Environment variables
+    # still win in ``FluxerAdapter.__init__``; these values are the profile-safe
+    # fallback and are essential when multiple Hermes profiles share a process.
+    seed = dict(cfg)
+    home_channel = cfg.get("home_channel")
+    if home_channel and not isinstance(home_channel, dict):
+        home_name = str(cfg.get("home_channel_name") or home_channel)
+        seed["home_channel"] = {"chat_id": str(home_channel), "name": home_name}
+    if "home_guilds" in cfg and "home_guild_ids" not in seed:
+        seed["home_guild_ids"] = cfg.get("home_guilds")
+
+    # Hermes performs a second authorization gate after the adapter.  In a
+    # multiplexed profile, YAML values intentionally never become process-global
+    # FLUXER_* variables, so mirror this adapter's allowlist into Hermes' generic
+    # config-only policy keys.  This preserves deny-by-default while preventing
+    # an authorized profile user from being rejected by the gateway's env-only
+    # fallback.
+    if _coerce_bool(cfg.get("allow_all_users"), False):
+        seed.setdefault("allow_from", ["*"])
+        seed.setdefault("group_allow_from", ["*"])
+    elif cfg.get("allowed_users"):
+        seed.setdefault("allow_from", cfg.get("allowed_users"))
+        seed.setdefault("group_allow_from", cfg.get("allowed_users"))
 
     scalar_env = {
         "bot_token": "FLUXER_BOT_TOKEN",
@@ -2801,7 +2997,7 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "native_command_guilds": "FLUXER_NATIVE_COMMAND_GUILDS",
     }
     for key, env_name in scalar_env.items():
-        if key in cfg:
+        if not scoped_load and key in cfg:
             _set_env_default(env_name, cfg.get(key))
 
     voice_raw = cfg.get("voice")
@@ -2834,7 +3030,7 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "sample_rate": "FLUXER_VOICE_SAMPLE_RATE",
     }
     for key, env_name in voice_scalar_env.items():
-        if key in voice:
+        if not scoped_load and key in voice:
             _set_env_default(env_name, voice.get(key))
 
     vad_raw = voice.get("vad")
@@ -2847,7 +3043,7 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "energy_threshold": "FLUXER_VOICE_ENERGY_THRESHOLD",
         "frame_ms": "FLUXER_VOICE_FRAME_MS",
     }.items():
-        if key in vad:
+        if not scoped_load and key in vad:
             _set_env_default(env_name, vad.get(key))
 
     timeouts_raw = voice.get("timeouts")
@@ -2861,7 +3057,7 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "start_cooldown_seconds": "FLUXER_VOICE_START_COOLDOWN_SECONDS",
         "stop_timeout_seconds": "FLUXER_VOICE_STOP_TIMEOUT_SECONDS",
     }.items():
-        if key in timeouts:
+        if not scoped_load and key in timeouts:
             _set_env_default(env_name, timeouts.get(key))
 
     barge_in_raw = voice.get("barge_in")
@@ -2878,28 +3074,28 @@ def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> dict | None:
         "stop_phrase_max_seconds": "FLUXER_VOICE_BARGE_IN_STOP_PHRASE_MAX_SECONDS",
         "after_first_audio_only": "FLUXER_VOICE_BARGE_IN_AFTER_FIRST_AUDIO_ONLY",
     }.items():
-        if key in barge_in:
+        if not scoped_load and key in barge_in:
             _set_env_default(env_name, barge_in.get(key))
 
-    return None
+    return seed or None
 
 
 def _env_enablement() -> dict | None:
-    base_url = os.getenv("FLUXER_BASE_URL", "").strip()
-    token = os.getenv("FLUXER_BOT_TOKEN", "").strip()
+    base_url = _fluxer_env("FLUXER_BASE_URL", "").strip()
+    token = _fluxer_env("FLUXER_BOT_TOKEN", "").strip()
     if not token:
         return None
     seed: dict = {"bot_token": token}
     if base_url:
         seed["base_url"] = base_url
-    gateway_url = os.getenv("FLUXER_GATEWAY_URL", "").strip()
+    gateway_url = _fluxer_env("FLUXER_GATEWAY_URL", "").strip()
     if gateway_url:
         seed["gateway_url"] = gateway_url
-    home = os.getenv("FLUXER_HOME_CHANNEL", "").strip()
+    home = _fluxer_env("FLUXER_HOME_CHANNEL", "").strip()
     if home:
         seed["home_channel"] = {
             "chat_id": home,
-            "name": os.getenv("FLUXER_HOME_CHANNEL_NAME", "").strip() or home,
+            "name": _fluxer_env("FLUXER_HOME_CHANNEL_NAME", "").strip() or home,
         }
     return seed
 

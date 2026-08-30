@@ -1,6 +1,6 @@
 [project]
 name = "hermes-fluxer-plugin"
-version = "0.2.4"
+version = "0.2.6"
 description = "Fluxer platform plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,3 +35,8 @@ py-modules = ["adapter", "livekit_bridge", "xai_realtime"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff.lint]
+# Keep CI independent from Ruff's expanding default rule set. Bandit and
+# CodeQL provide the separate security-focused gates.
+select = ["E4", "E7", "E9", "F"]
