@@ -31,16 +31,17 @@ def restore_fluxer_env_after_test():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("media_path", "method_name"),
+    ("media_name", "method_name"),
     [
-        ("/tmp/photo.png", "send_image_file"),
-        ("/tmp/clip.mp4", "send_video"),
-        ("/tmp/report.pdf", "send_document"),
+        ("photo.png", "send_image_file"),
+        ("clip.mp4", "send_video"),
+        ("report.pdf", "send_document"),
     ],
 )
 async def test_standalone_single_media_uses_message_as_native_caption(
-    monkeypatch, media_path, method_name
+    monkeypatch, tmp_path, media_name, method_name
 ):
+    media_path = str(tmp_path / media_name)
     fake = AsyncMock()
     fake.send.return_value = fluxer_adapter.SendResult(success=True, message_id="text-id")
     getattr(fake, method_name).return_value = fluxer_adapter.SendResult(
@@ -67,7 +68,10 @@ async def test_standalone_single_media_uses_message_as_native_caption(
 
 
 @pytest.mark.asyncio
-async def test_standalone_voice_keeps_text_separate_from_native_voice_message(monkeypatch):
+async def test_standalone_voice_keeps_text_separate_from_native_voice_message(
+    monkeypatch, tmp_path
+):
+    media_path = str(tmp_path / "voice.ogg")
     fake = AsyncMock()
     fake.send.return_value = fluxer_adapter.SendResult(success=True, message_id="text-id")
     fake.send_voice.return_value = fluxer_adapter.SendResult(
@@ -79,19 +83,22 @@ async def test_standalone_voice_keeps_text_separate_from_native_voice_message(mo
         PlatformConfig(enabled=True),
         "chan-1",
         "Voice introduction",
-        media_files=[("/tmp/voice.ogg", True)],
+        media_files=[(media_path, True)],
     )
 
     assert result["success"] is True
     assert result["message_id"] == "voice-id"
     fake.send.assert_awaited_once_with("chan-1", "Voice introduction", metadata=None)
     fake.send_voice.assert_awaited_once_with(
-        "chan-1", "/tmp/voice.ogg", metadata=None
+        "chan-1", media_path, metadata=None
     )
 
 
 @pytest.mark.asyncio
-async def test_standalone_plain_audio_is_a_document_with_native_caption(monkeypatch):
+async def test_standalone_plain_audio_is_a_document_with_native_caption(
+    monkeypatch, tmp_path
+):
+    media_path = str(tmp_path / "audio.ogg")
     fake = AsyncMock()
     fake.send_document.return_value = fluxer_adapter.SendResult(
         success=True, message_id="audio-file-id"
@@ -102,7 +109,7 @@ async def test_standalone_plain_audio_is_a_document_with_native_caption(monkeypa
         PlatformConfig(enabled=True),
         "chan-1",
         "Audio attachment",
-        media_files=["/tmp/audio.ogg"],
+        media_files=[media_path],
     )
 
     assert result["success"] is True
@@ -110,14 +117,15 @@ async def test_standalone_plain_audio_is_a_document_with_native_caption(monkeypa
     fake.send_voice.assert_not_awaited()
     fake.send_document.assert_awaited_once_with(
         "chan-1",
-        "/tmp/audio.ogg",
+        media_path,
         caption="Audio attachment",
         metadata=None,
     )
 
 
 @pytest.mark.asyncio
-async def test_standalone_rolls_back_text_after_media_failure(monkeypatch):
+async def test_standalone_rolls_back_text_after_media_failure(monkeypatch, tmp_path):
+    media_path = str(tmp_path / "voice.ogg")
     fake = AsyncMock()
     fake.send.return_value = fluxer_adapter.SendResult(
         success=True, message_id="text-id"
@@ -132,7 +140,7 @@ async def test_standalone_rolls_back_text_after_media_failure(monkeypatch):
         PlatformConfig(enabled=True),
         "chan-1",
         "Voice introduction",
-        media_files=[("/tmp/voice.ogg", True)],
+        media_files=[(media_path, True)],
     )
 
     assert result == {
@@ -143,7 +151,10 @@ async def test_standalone_rolls_back_text_after_media_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_standalone_media_only_failure_does_not_claim_a_rollback(monkeypatch):
+async def test_standalone_media_only_failure_does_not_claim_a_rollback(
+    monkeypatch, tmp_path
+):
+    media_path = str(tmp_path / "report.pdf")
     fake = AsyncMock()
     fake.send_document.return_value = fluxer_adapter.SendResult(
         success=False, error="upload failed"
@@ -154,7 +165,7 @@ async def test_standalone_media_only_failure_does_not_claim_a_rollback(monkeypat
         PlatformConfig(enabled=True),
         "chan-1",
         "",
-        media_files=["/tmp/report.pdf"],
+        media_files=[media_path],
     )
 
     assert result == {"error": "Fluxer media send failed"}
@@ -162,7 +173,10 @@ async def test_standalone_media_only_failure_does_not_claim_a_rollback(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_standalone_marks_incomplete_rollback_success_to_prevent_retry(monkeypatch):
+async def test_standalone_marks_incomplete_rollback_success_to_prevent_retry(
+    monkeypatch, tmp_path
+):
+    media_path = str(tmp_path / "voice.ogg")
     fake = AsyncMock()
     fake.send.return_value = fluxer_adapter.SendResult(
         success=True, message_id="text-id"
@@ -177,7 +191,7 @@ async def test_standalone_marks_incomplete_rollback_success_to_prevent_retry(mon
         PlatformConfig(enabled=True),
         "chan-1",
         "Voice introduction",
-        media_files=[("/tmp/voice.ogg", True)],
+        media_files=[(media_path, True)],
     )
 
     assert result == {
@@ -194,7 +208,8 @@ async def test_standalone_marks_incomplete_rollback_success_to_prevent_retry(mon
 
 
 @pytest.mark.asyncio
-async def test_standalone_uses_utf16_length_for_native_caption(monkeypatch):
+async def test_standalone_uses_utf16_length_for_native_caption(monkeypatch, tmp_path):
+    media_path = str(tmp_path / "photo.png")
     fake = AsyncMock()
     fake.send.return_value = fluxer_adapter.SendResult(
         success=True, message_id="text-id"
@@ -209,13 +224,13 @@ async def test_standalone_uses_utf16_length_for_native_caption(monkeypatch):
         PlatformConfig(enabled=True),
         "chan-1",
         caption,
-        media_files=["/tmp/photo.png"],
+        media_files=[media_path],
     )
 
     assert result["success"] is True
     fake.send.assert_awaited_once_with("chan-1", caption, metadata=None)
     fake.send_image_file.assert_awaited_once_with(
-        "chan-1", "/tmp/photo.png", caption=None, metadata=None
+        "chan-1", media_path, caption=None, metadata=None
     )
 
 
@@ -273,11 +288,12 @@ async def test_live_send_handler_preserves_plain_text_exactly(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_send_handler_prefers_host_normalized_cron_context(monkeypatch):
+async def test_send_handler_prefers_host_normalized_cron_context(monkeypatch, tmp_path):
     standalone = AsyncMock(return_value={"success": True, "message_id": "cron-id"})
     monkeypatch.setattr(fluxer_adapter, "_standalone_send", standalone)
     config = PlatformConfig(enabled=True)
-    media_files = [("/tmp/report.pdf", False)]
+    media_path = str(tmp_path / "report.pdf")
+    media_files = [(media_path, False)]
 
     result = await fluxer_adapter._send_message_handler(
         {},
