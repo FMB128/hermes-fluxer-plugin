@@ -30,6 +30,67 @@ def restore_fluxer_env_after_test():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("media_path", "method_name"),
+    [
+        ("/tmp/photo.png", "send_image_file"),
+        ("/tmp/clip.mp4", "send_video"),
+        ("/tmp/report.pdf", "send_document"),
+    ],
+)
+async def test_standalone_single_media_uses_message_as_native_caption(
+    monkeypatch, media_path, method_name
+):
+    fake = AsyncMock()
+    fake.send.return_value = fluxer_adapter.SendResult(success=True, message_id="text-id")
+    getattr(fake, method_name).return_value = fluxer_adapter.SendResult(
+        success=True, message_id="media-id"
+    )
+    monkeypatch.setattr(fluxer_adapter, "FluxerAdapter", lambda _config: fake)
+
+    result = await fluxer_adapter._standalone_send(
+        PlatformConfig(enabled=True),
+        "chan-1",
+        "Native caption",
+        media_files=[media_path],
+    )
+
+    assert result["success"] is True
+    assert result["message_id"] == "media-id"
+    fake.send.assert_not_awaited()
+    getattr(fake, method_name).assert_awaited_once_with(
+        "chan-1",
+        media_path,
+        caption="Native caption",
+        metadata=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_standalone_voice_keeps_text_separate_from_native_voice_message(monkeypatch):
+    fake = AsyncMock()
+    fake.send.return_value = fluxer_adapter.SendResult(success=True, message_id="text-id")
+    fake.send_voice.return_value = fluxer_adapter.SendResult(
+        success=True, message_id="voice-id"
+    )
+    monkeypatch.setattr(fluxer_adapter, "FluxerAdapter", lambda _config: fake)
+
+    result = await fluxer_adapter._standalone_send(
+        PlatformConfig(enabled=True),
+        "chan-1",
+        "Voice introduction",
+        media_files=["/tmp/voice.ogg"],
+    )
+
+    assert result["success"] is True
+    assert result["message_id"] == "voice-id"
+    fake.send.assert_awaited_once_with("chan-1", "Voice introduction", metadata=None)
+    fake.send_voice.assert_awaited_once_with(
+        "chan-1", "/tmp/voice.ogg", metadata=None
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_reaction_defaults_to_last_processed_inbound_message(monkeypatch):
     monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
     monkeypatch.delenv("FLUXER_REQUIRE_MENTION", raising=False)
@@ -294,15 +355,15 @@ def test_plugin_manifest_is_platform_plugin():
     }.issubset(optional)
 
 
-def test_release_metadata_matches_v030_changelog():
+def test_release_metadata_matches_v031_changelog():
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
     with (ROOT / "pyproject.toml").open("rb") as handle:
         project = tomllib.load(handle)["project"]
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert manifest["version"] == "0.3.0"
-    assert project["version"] == "0.3.0"
-    assert "## [0.3.0] - 2026-08-30" in changelog
+    assert manifest["version"] == "0.3.1"
+    assert project["version"] == "0.3.1"
+    assert "## [0.3.1] - 2026-08-30" in changelog
 
 
 def test_fluxer_adapter_advertises_markdown_code_blocks():

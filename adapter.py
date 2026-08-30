@@ -3192,11 +3192,29 @@ async def _standalone_send(
     metadata = {"thread_id": thread_id} if thread_id else None
     try:
         last: Optional[SendResult] = None
-        if message:
+        media_items = media_files or []
+        native_caption: Optional[str] = None
+        if message and len(media_items) == 1:
+            media_item = media_items[0]
+            if isinstance(media_item, (tuple, list)):
+                media_path = str(media_item[0])
+                is_voice_directive = bool(media_item[1]) if len(media_item) > 1 else False
+            else:
+                media_path = str(media_item)
+                is_voice_directive = False
+            ext = Path(media_path).suffix.lower()
+            is_voice_or_audio = is_voice_directive or ext in {
+                ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac", ".aac"
+            }
+            if force_document or not is_voice_or_audio:
+                candidate = message.strip()
+                if candidate and len(candidate) <= MAX_MESSAGE_LENGTH:
+                    native_caption = candidate
+        if message and native_caption is None:
             last = await adapter.send(chat_id, message, metadata=metadata)
             if not last.success:
                 return {"error": last.error or "Fluxer send failed"}
-        for media_item in media_files or []:
+        for media_item in media_items:
             if isinstance(media_item, (tuple, list)):
                 media_path = str(media_item[0])
                 is_voice_directive = bool(media_item[1]) if len(media_item) > 1 else False
@@ -3205,13 +3223,19 @@ async def _standalone_send(
                 is_voice_directive = False
             ext = Path(media_path).suffix.lower()
             if not force_document and ext in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
-                last = await adapter.send_image_file(chat_id, media_path, metadata=metadata)
+                last = await adapter.send_image_file(
+                    chat_id, media_path, caption=native_caption, metadata=metadata
+                )
             elif not force_document and ext in {".mp4", ".mov", ".webm", ".mkv", ".avi"}:
-                last = await adapter.send_video(chat_id, media_path, metadata=metadata)
+                last = await adapter.send_video(
+                    chat_id, media_path, caption=native_caption, metadata=metadata
+                )
             elif not force_document and (is_voice_directive or ext in {".mp3", ".m4a", ".ogg", ".opus", ".wav", ".flac", ".aac"}):
                 last = await adapter.send_voice(chat_id, media_path, metadata=metadata)
             else:
-                last = await adapter.send_document(chat_id, media_path, metadata=metadata)
+                last = await adapter.send_document(
+                    chat_id, media_path, caption=native_caption, metadata=metadata
+                )
             if not last.success:
                 return {"error": last.error or "Fluxer media send failed"}
         if last and last.success:

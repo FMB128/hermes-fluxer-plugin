@@ -9,6 +9,18 @@ This project uses simple semantic versioning while the plugin is young:
 - major versions only for breaking configuration or runtime behavior.
 
 
+## [0.3.1] - 2026-08-30
+
+### Fixed
+
+- A single image, video, or document sent with a short message now keeps that message as the attachment's native caption instead of posting a separate text bubble followed by an uncaptioned file.
+
+### Verification
+
+- Focused regressions cover image, video, and document captions while preserving the separate text-plus-audio behavior required for native voice messages.
+- Live provider readback exposed the split-caption defect before the fix; the corrected v0.3.1 path is rechecked during the release acceptance run.
+
+
 ## [0.3.0] - 2026-08-30
 
 ### Added
