@@ -9,6 +9,19 @@ This project uses simple semantic versioning while the plugin is young:
 - major versions only for breaking configuration or runtime behavior.
 
 
+## [0.3.2] - 2026-08-30
+
+### Fixed
+
+- Images, documents, videos, and voice notes sent through Hermes' live `send_message` tool now reach Fluxer instead of being reduced to text-only messages.
+- Live Gateway delivery now uses the same attachment, caption, voice-note, and document-routing behavior as standalone and scheduled sends.
+
+### Verification
+
+- Focused regressions prove that full live-tool requests retain safe media files, captions, voice directives, and explicit document delivery before they reach Fluxer.
+- The full supported Python matrix and live provider readback are release gates for this patch.
+
+
 ## [0.3.1] - 2026-08-30
 
 ### Fixed

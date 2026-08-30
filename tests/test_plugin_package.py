@@ -91,6 +91,74 @@ async def test_standalone_voice_keeps_text_separate_from_native_voice_message(mo
 
 
 @pytest.mark.asyncio
+async def test_live_send_handler_preserves_media_and_force_document(tmp_path, monkeypatch):
+    image = tmp_path / "original.png"
+    image.write_bytes(b"not-a-real-png")
+    standalone = AsyncMock(return_value={"success": True, "message_id": "media-id"})
+    monkeypatch.setattr(fluxer_adapter, "_standalone_send", standalone)
+    config = PlatformConfig(enabled=True)
+
+    result = await fluxer_adapter._send_message_handler(
+        {
+            "message": f"[[as_document]]\nMEDIA:{image}\nNative caption",
+            "thread_id": "thread-1",
+        },
+        "chan-1",
+        "fluxer",
+        config,
+    )
+
+    assert result == {"success": True, "message_id": "media-id"}
+    standalone.assert_awaited_once_with(
+        config,
+        "chan-1",
+        "Native caption",
+        thread_id="thread-1",
+        media_files=[(str(image.resolve()), False)],
+        force_document=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_send_handler_preserves_plain_text_exactly(monkeypatch):
+    standalone = AsyncMock(return_value={"success": True, "message_id": "text-id"})
+    monkeypatch.setattr(fluxer_adapter, "_standalone_send", standalone)
+    config = PlatformConfig(enabled=True)
+
+    result = await fluxer_adapter._send_message_handler(
+        {"message": "  intentional spacing  "},
+        "chan-1",
+        "fluxer",
+        config,
+    )
+
+    assert result == {"success": True, "message_id": "text-id"}
+    standalone.assert_awaited_once_with(
+        config,
+        "chan-1",
+        "  intentional spacing  ",
+        thread_id=None,
+        media_files=[],
+        force_document=False,
+    )
+
+
+def test_register_exposes_full_request_send_handler():
+    class Context:
+        kwargs = None
+
+        def register_platform(self, **kwargs):
+            self.kwargs = kwargs
+
+    ctx = Context()
+    fluxer_adapter.register(ctx)
+
+    assert ctx.kwargs is not None
+    assert ctx.kwargs["send_message_handler"] is fluxer_adapter._send_message_handler
+    assert ctx.kwargs["standalone_sender_fn"] is fluxer_adapter._standalone_send
+
+
+@pytest.mark.asyncio
 async def test_agent_reaction_defaults_to_last_processed_inbound_message(monkeypatch):
     monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
     monkeypatch.delenv("FLUXER_REQUIRE_MENTION", raising=False)
@@ -355,15 +423,15 @@ def test_plugin_manifest_is_platform_plugin():
     }.issubset(optional)
 
 
-def test_release_metadata_matches_v031_changelog():
+def test_release_metadata_matches_v032_changelog():
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
     with (ROOT / "pyproject.toml").open("rb") as handle:
         project = tomllib.load(handle)["project"]
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert manifest["version"] == "0.3.1"
-    assert project["version"] == "0.3.1"
-    assert "## [0.3.1] - 2026-08-30" in changelog
+    assert manifest["version"] == "0.3.2"
+    assert project["version"] == "0.3.2"
+    assert "## [0.3.2] - 2026-08-30" in changelog
 
 
 def test_fluxer_adapter_advertises_markdown_code_blocks():

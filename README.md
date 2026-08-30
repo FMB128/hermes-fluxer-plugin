@@ -73,7 +73,7 @@ Implemented:
 - replies / referenced message context
 - message edits and deletes
 - pins, when the Fluxer server supports pin routes
-- media and document delivery where Fluxer's API supports uploads or attachment URLs; a short message accompanying one image, video, or document is delivered as that attachment's native caption
+- media and document delivery from live Gateway tool calls, standalone sends, and scheduled delivery where Fluxer's API supports uploads or attachment URLs; a short message accompanying one image, video, or document is delivered as that attachment's native caption
 - voice-message roundtrip: inbound voice-shaped attachments are cached as audio for Hermes STT, and outbound `send_voice` uploads Fluxer voice-message payloads with duration/waveform metadata
 - reactions for approval and slash-confirm flows, plus agent-requested react/unreact actions
 - component buttons for approval flows, with reaction fallback

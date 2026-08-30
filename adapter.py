@@ -3245,6 +3245,28 @@ async def _standalone_send(
         return {"error": str(exc)}
 
 
+async def _send_message_handler(
+    args: Dict[str, Any],
+    chat_id: str,
+    _platform_name: str,
+    pconfig: PlatformConfig,
+) -> Dict[str, Any]:
+    """Preserve Fluxer MEDIA directives on the core full-request path."""
+    raw_message = str(args.get("message") or "")
+    force_document = "[[as_document]]" in raw_message
+    media_files, cleaned_message = BasePlatformAdapter.extract_media(raw_message)
+    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    thread_id = args.get("thread_id")
+    return await _standalone_send(
+        pconfig,
+        chat_id,
+        cleaned_message,
+        thread_id=str(thread_id) if thread_id else None,
+        media_files=media_files,
+        force_document=force_document,
+    )
+
+
 def interactive_setup() -> None:
     print("Fluxer platform setup")
     print("Set FLUXER_BOT_TOKEN in ~/.hermes/.env, then restart the gateway.")
@@ -3266,6 +3288,7 @@ def register(ctx) -> None:
         apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="FLUXER_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        send_message_handler=_send_message_handler,
         allowed_users_env="FLUXER_ALLOWED_USERS",
         allow_all_env="FLUXER_ALLOW_ALL_USERS",
         max_message_length=MAX_MESSAGE_LENGTH,
