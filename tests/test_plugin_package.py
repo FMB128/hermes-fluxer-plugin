@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import os
 import time
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 try:
@@ -29,6 +29,252 @@ def restore_fluxer_env_after_test():
     os.environ.update(original)
 
 
+@pytest.mark.asyncio
+async def test_agent_reaction_defaults_to_last_processed_inbound_message(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_REQUIRE_MENTION", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "require_mention": False,
+            },
+        )
+    )
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_message_create(
+        {
+            "id": "msg-latest",
+            "channel_id": "chan-1",
+            "channel_type": "channel",
+            "content": "React to this",
+            "author": {"id": "owner-user", "username": "Alice", "bot": False},
+        },
+        {"op": 0, "t": "MESSAGE_CREATE", "d": {}},
+    )
+    adapter._request = AsyncMock(return_value={})
+
+    result = await adapter.add_reaction("chan-1", "👍")
+
+    assert result == {"success": True, "message_id": "msg-latest"}
+    adapter._request.assert_awaited_once_with(
+        "PUT",
+        "/channels/chan-1/messages/msg-latest/reactions/%F0%9F%91%8D/@me",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_reaction_requires_a_target_message(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(return_value={})
+
+    result = await adapter.add_reaction("chan-1", "👍")
+
+    assert result == {
+        "success": False,
+        "error": "no message to react to — pass message_id",
+    }
+    adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_reaction_failure_does_not_expose_api_error(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(side_effect=RuntimeError("private upstream body"))
+
+    result = await adapter.add_reaction("chan-1", "👍", message_id="msg-explicit")
+
+    assert result == {
+        "success": False,
+        "error": "reaction failed (see gateway debug log)",
+    }
+    assert "private upstream body" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_agent_reaction_rejects_an_empty_emoji(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(return_value={})
+
+    result = await adapter.add_reaction("chan-1", "", message_id="msg-explicit")
+
+    assert result == {"success": False, "error": "emoji is required"}
+    adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_unreact_removes_every_reaction_owned_by_the_bot(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(
+        side_effect=[
+            {
+                "id": "msg-explicit",
+                "reactions": [
+                    {"emoji": {"id": None, "name": "👍"}, "count": 2, "me": True},
+                    {"emoji": {"id": "123", "name": "party"}, "count": 1, "me": True},
+                    {"emoji": {"id": None, "name": "❤️"}, "count": 1, "me": False},
+                ],
+            },
+            {},
+            {},
+        ]
+    )
+
+    result = await adapter.remove_reaction("chan-1", message_id="msg-explicit")
+
+    assert result == {"success": True, "message_id": "msg-explicit", "removed": 2}
+    assert adapter._request.await_args_list == [
+        call("GET", "/channels/chan-1/messages/msg-explicit"),
+        call(
+            "DELETE",
+            "/channels/chan-1/messages/msg-explicit/reactions/%F0%9F%91%8D/@me",
+        ),
+        call(
+            "DELETE",
+            "/channels/chan-1/messages/msg-explicit/reactions/party%3A123/@me",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_unreact_requires_a_target_message(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(return_value={})
+
+    result = await adapter.remove_reaction("chan-1")
+
+    assert result == {
+        "success": False,
+        "error": "no message to unreact — pass message_id",
+    }
+    adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_unreact_failure_does_not_expose_api_error(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"bot_token": "app.secret", "allow_all_users": True},
+        )
+    )
+    adapter._request = AsyncMock(side_effect=RuntimeError("private upstream body"))
+
+    result = await adapter.remove_reaction("chan-1", message_id="msg-explicit")
+
+    assert result == {
+        "success": False,
+        "error": "unreact failed (see gateway debug log)",
+    }
+    assert "private upstream body" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_deleted_latest_inbound_is_not_used_as_reaction_target(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_REQUIRE_MENTION", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "require_mention": False,
+            },
+        )
+    )
+    adapter.handle_message = AsyncMock()
+    await adapter._handle_message_create(
+        {
+            "id": "msg-deleted",
+            "channel_id": "chan-1",
+            "channel_type": "channel",
+            "content": "This will be deleted",
+            "author": {"id": "owner-user", "username": "Alice", "bot": False},
+        },
+        {"op": 0, "t": "MESSAGE_CREATE", "d": {}},
+    )
+    await adapter._handle_message_delete(
+        {"id": "msg-deleted", "channel_id": "chan-1"}
+    )
+    adapter._request = AsyncMock(return_value={})
+
+    result = await adapter.add_reaction("chan-1", "👍")
+
+    assert result == {
+        "success": False,
+        "error": "no message to react to — pass message_id",
+    }
+    adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reaction_target_history_is_bounded(monkeypatch):
+    monkeypatch.delenv("FLUXER_ALLOW_ALL_USERS", raising=False)
+    monkeypatch.delenv("FLUXER_REQUIRE_MENTION", raising=False)
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "bot_token": "app.secret",
+                "allow_all_users": True,
+                "require_mention": False,
+            },
+        )
+    )
+    adapter.handle_message = AsyncMock()
+
+    for index in range(1001):
+        await adapter._handle_message_create(
+            {
+                "id": f"msg-{index}",
+                "channel_id": f"chan-{index}",
+                "channel_type": "channel",
+                "content": "remember me",
+                "author": {"id": "owner-user", "username": "Alice", "bot": False},
+            },
+            {"op": 0, "t": "MESSAGE_CREATE", "d": {}},
+        )
+
+    assert len(adapter._last_inbound_by_chat) == 1000
+    assert "chan-0" not in adapter._last_inbound_by_chat
+    assert adapter._last_inbound_by_chat["chan-1000"] == "msg-1000"
+
+
 def test_plugin_manifest_is_platform_plugin():
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
 
@@ -46,6 +292,17 @@ def test_plugin_manifest_is_platform_plugin():
         "FLUXER_VOICE_STT_PROVIDER",
         "FLUXER_VOICE_CONTEXT_FILE",
     }.issubset(optional)
+
+
+def test_release_metadata_matches_v030_changelog():
+    manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        project = tomllib.load(handle)["project"]
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert manifest["version"] == "0.3.0"
+    assert project["version"] == "0.3.0"
+    assert "## [0.3.0] - 2026-08-30" in changelog
 
 
 def test_fluxer_adapter_advertises_markdown_code_blocks():
@@ -88,8 +345,8 @@ def test_asyncio_wait_for_timeout_handlers_are_python310_safe():
 def test_user_agent_version_matches_release_manifest():
     source = (ROOT / "adapter.py").read_text(encoding="utf-8")
 
-    assert "Hermes-Fluxer/0.1" not in source
-    assert "Hermes-Fluxer/0.2" in source
+    assert "Hermes-Fluxer/0.2" not in source
+    assert "Hermes-Fluxer/0.3" in source
 
 
 def test_fluxer_voice_yaml_config_bridge_sets_env_defaults(monkeypatch):

@@ -75,7 +75,7 @@ Implemented:
 - pins, when the Fluxer server supports pin routes
 - media and document delivery where Fluxer's API supports uploads or attachment URLs
 - voice-message roundtrip: inbound voice-shaped attachments are cached as audio for Hermes STT, and outbound `send_voice` uploads Fluxer voice-message payloads with duration/waveform metadata
-- reactions for approval and slash-confirm flows
+- reactions for approval and slash-confirm flows, plus agent-requested react/unreact actions
 - component buttons for approval flows, with reaction fallback
 - channel-directory enumeration for Hermes delivery targets
 - home-channel delivery for cron jobs and notifications

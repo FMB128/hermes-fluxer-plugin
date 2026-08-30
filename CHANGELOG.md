@@ -9,6 +9,25 @@ This project uses simple semantic versioning while the plugin is young:
 - major versions only for breaking configuration or runtime behavior.
 
 
+## [0.3.0] - 2026-08-30
+
+### Added
+
+- Hermes can now add or remove its own reaction on a Fluxer message through the standard `send_message` react/unreact actions.
+- When no message ID is supplied, the reaction targets the latest user message that Hermes actually accepted in that chat.
+
+### User impact
+
+- The agent can acknowledge, celebrate, or quietly signal that it has seen a message without posting another text reply.
+- Removed messages and ignored group chatter are not retained as automatic reaction targets.
+
+### Verification
+
+- `pytest -q` → 220 passed on Python 3.10, 3.11, and 3.12.
+- Python compilation, Ruff, Bandit, dependency audit, diff checks, and secret-shape checks passed.
+- Focused reaction regressions cover explicit and automatic targets, Unicode and custom emoji, removal, deleted messages, bounded state, and private-error handling.
+
+
 ## [0.2.6] - 2026-08-30
 
 ### Fixed
