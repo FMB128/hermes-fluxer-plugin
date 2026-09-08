@@ -25,7 +25,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Verification
 
-- 9 new unit tests cover identify presence, opcode-3 payload shape, status normalization, config parsing, and the unscoped-multiplex env fallback (full suite: 240 passed; the four secret-scope tests skip when `agent.secret_scope` is not importable, and the new fallback test passes against Hermes' real secret-scope module).
+- 13 new unit tests cover identify presence, opcode-3 payload shape, status normalization, config parsing, deterministic env-helper branch coverage (shared `get_scoped_secret` helper, legacy `UnscopedSecretError` fallback, plain `os.getenv` older hosts — via controlled module stubs, no Hermes install required), and the READY→opcode-3 lifecycle including send-failure tolerance (full suite: 245 passed).
 - Live-verified against Fluxer: presence updates are accepted by the gateway (SESSIONS_REPLACE broadcast) and cached as online, and the adapter reconnects on a multiplexed Hermes host.
 
 ## [0.3.3] - 2026-08-30

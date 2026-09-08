@@ -2,7 +2,9 @@ from pathlib import Path
 import ast
 import asyncio
 import inspect
+import json
 import os
+import sys
 import time
 from unittest.mock import AsyncMock, call
 
@@ -882,20 +884,121 @@ def test_multiplexed_adapter_reads_active_profile_scope_not_process_env(monkeypa
     assert child_env["XAI_API_KEY"] == "secondary-xai"
 
 
-def test_fluxer_env_does_not_raise_unscoped_under_multiplex(monkeypatch):
-    """Default-profile adapter construction can run outside a secret scope under
-    multiplexing, where get_secret raises UnscopedSecretError; _fluxer_env must
-    fall back to os.environ instead of propagating the raise."""
-    secret_scope = pytest.importorskip("agent.secret_scope")
-    monkeypatch.setenv("FLUXER_BOT_TOKEN", "primary-token")
-    monkeypatch.delenv("FLUXER_MISSING_KEY", raising=False)
-    secret_scope.set_multiplex_active(True)
-    try:
-        assert fluxer_adapter._fluxer_env("FLUXER_BOT_TOKEN") == "primary-token"
-        assert fluxer_adapter._fluxer_env("FLUXER_MISSING_KEY", "fallback") == "fallback"
-        assert fluxer_adapter._fluxer_env("FLUXER_MISSING_KEY") is None
-    finally:
-        secret_scope.set_multiplex_active(False)
+def _stub_module(name: str, **attrs):
+    import types as _types
+
+    mod = _types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(mod, key, value)
+    return mod
+
+
+def _install_gateway_shared_helper(monkeypatch, get_scoped_secret):
+    monkeypatch.setitem(sys.modules, "gateway", _stub_module("gateway", __path__=[]))
+    monkeypatch.setitem(sys.modules, "gateway.platforms", _stub_module("gateway.platforms", __path__=[]))
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.platforms._shared",
+        _stub_module("gateway.platforms._shared", get_scoped_secret=get_scoped_secret),
+    )
+
+
+def test_fluxer_env_prefers_gateway_shared_helper(monkeypatch):
+    """When Hermes' sanctioned scoped-secret helper is importable, _fluxer_env
+    delegates to it (profile scope / default-profile fallback semantics live
+    there) instead of reading os.environ directly."""
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "env-token")
+    calls = []
+
+    def get_scoped_secret(name, default=None):
+        calls.append(name)
+        return "shared-val" if name == "FLUXER_BOT_TOKEN" else default
+
+    _install_gateway_shared_helper(monkeypatch, get_scoped_secret)
+    assert fluxer_adapter._fluxer_env("FLUXER_BOT_TOKEN") == "shared-val"
+    assert fluxer_adapter._fluxer_env("FLUXER_UNSET", "dflt") == "dflt"
+    assert calls == ["FLUXER_BOT_TOKEN", "FLUXER_UNSET"]
+
+
+class _UnscopedSecretError(RuntimeError):
+    pass
+
+
+def test_fluxer_env_legacy_scope_raise_falls_back_to_os_env(monkeypatch):
+    """Legacy Hermes: agent.secret_scope.get_secret fails closed with
+    UnscopedSecretError when unscoped under multiplexing; _fluxer_env must fall
+    back to os.environ instead of propagating the raise."""
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "env-token")
+    monkeypatch.setitem(sys.modules, "gateway", None)  # no shared helper
+
+    def get_secret(name, default=None):
+        raise _UnscopedSecretError()
+
+    monkeypatch.setitem(sys.modules, "agent", _stub_module("agent", __path__=[]))
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.secret_scope",
+        _stub_module(
+            "agent.secret_scope",
+            UnscopedSecretError=_UnscopedSecretError,
+            get_secret=get_secret,
+        ),
+    )
+    assert fluxer_adapter._fluxer_env("FLUXER_BOT_TOKEN") == "env-token"
+    assert fluxer_adapter._fluxer_env("FLUXER_UNSET", "dflt") == "dflt"
+    assert fluxer_adapter._fluxer_env("FLUXER_UNSET") is None
+
+
+def test_fluxer_env_older_host_falls_back_to_plain_os_getenv(monkeypatch):
+    """Hermes without either scope API: every env read is plain os.getenv."""
+    monkeypatch.setenv("FLUXER_BOT_TOKEN", "env-token")
+    monkeypatch.setitem(sys.modules, "gateway", None)
+    monkeypatch.setitem(sys.modules, "agent", None)
+    assert fluxer_adapter._fluxer_env("FLUXER_BOT_TOKEN") == "env-token"
+    assert fluxer_adapter._fluxer_env("FLUXER_UNSET", "dflt") == "dflt"
+
+
+class _RecordingWs:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, data) -> None:
+        self.sent.append(data)
+
+
+@pytest.mark.asyncio
+async def test_ready_asserts_presence_via_op3_update():
+    """After a READY dispatch the adapter re-asserts the configured presence
+    with an opcode-3 update on the live websocket."""
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "presence_status": "dnd"})
+    )
+    ws = _RecordingWs()
+    adapter._ws = ws
+    await adapter._handle_gateway_dispatch({"op": 0, "t": "READY", "d": {"user": {"id": "bot-1"}}})
+    assert adapter.bot_user_id == "bot-1"
+    assert adapter._gateway_ready_event.is_set()
+    assert len(ws.sent) == 1
+    sent = json.loads(ws.sent[0])
+    assert sent["op"] == 3
+    assert sent["d"]["status"] == "dnd"
+    assert sent["d"]["afk"] is False
+
+
+@pytest.mark.asyncio
+async def test_ready_presence_send_failure_is_tolerated():
+    """Presence is best-effort: a failing websocket send on READY must not
+    break the gateway session (warning + continue)."""
+    class _FailingWs:
+        async def send(self, data) -> None:
+            raise RuntimeError("boom")
+
+    adapter = fluxer_adapter.FluxerAdapter(
+        PlatformConfig(enabled=True, extra={"bot_token": "app.secret"})
+    )
+    adapter._ws = _FailingWs()
+    await adapter._handle_gateway_dispatch({"op": 0, "t": "READY", "d": {"user": {"id": "bot-1"}}})
+    assert adapter._gateway_ready_event.is_set()
 
 
 def test_multiplexed_voice_child_env_drops_primary_fluxer_values_and_uses_profile_extras(monkeypatch):
