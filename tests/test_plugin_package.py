@@ -967,9 +967,11 @@ class _RecordingWs:
 
 
 @pytest.mark.asyncio
-async def test_ready_asserts_presence_via_op3_update():
+async def test_ready_asserts_presence_via_op3_update(monkeypatch):
     """After a READY dispatch the adapter re-asserts the configured presence
     with an opcode-3 update on the live websocket."""
+    monkeypatch.delenv("FLUXER_PRESENCE_STATUS", raising=False)
+    monkeypatch.delenv("FLUXER_PRESENCE_AFK", raising=False)
     adapter = fluxer_adapter.FluxerAdapter(
         PlatformConfig(enabled=True, extra={"bot_token": "app.secret", "presence_status": "dnd"})
     )
@@ -2607,7 +2609,9 @@ def test_presence_settings_parse_from_env(monkeypatch):
     assert adapter._presence_afk is True
 
 
-def test_presence_settings_parse_from_extra_config():
+def test_presence_settings_parse_from_extra_config(monkeypatch):
+    monkeypatch.delenv("FLUXER_PRESENCE_STATUS", raising=False)
+    monkeypatch.delenv("FLUXER_PRESENCE_AFK", raising=False)
     adapter = fluxer_adapter.FluxerAdapter(
         PlatformConfig(
             enabled=True,
