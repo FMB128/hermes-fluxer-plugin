@@ -119,8 +119,8 @@ def _fluxer_env(name: str, default: Any = None) -> Any:
     *unscoped* (``agent.secret_scope.get_secret`` raises
     ``UnscopedSecretError`` there), so prefer Hermes' own
     ``gateway.platforms._shared.get_scoped_secret`` helper, which mirrors the
-    default-profile fallback: scoped miss -> ``os.environ`` (that profile's
-    own value), unscoped read -> ``os.environ`` instead of raising.
+    default-profile fallback: a scoped miss remains authoritative; an
+    unscoped default-profile read uses ``os.environ`` instead of raising.
     """
     try:
         from gateway.platforms._shared import get_scoped_secret
@@ -2512,11 +2512,11 @@ class FluxerAdapter(BasePlatformAdapter):
         try:
             success = await self._send_gateway_payload(payload)
             if success:
-                logger.info("Fluxer presence update sent: status=%s", self._presence_status)
+                logger.info("Fluxer presence update sent")
             else:
                 logger.debug("Fluxer presence update skipped: websocket unavailable")
         except Exception as exc:
-            logger.warning("Fluxer presence update failed (continuing): %s", exc)
+            logger.warning("Fluxer presence update failed (continuing): %s", type(exc).__name__)
 
     async def wait_until_gateway_ready(self, timeout: float = 10.0) -> bool:
         """Wait until Fluxer gateway identification has completed with READY."""

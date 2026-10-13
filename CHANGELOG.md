@@ -17,6 +17,7 @@ This project uses simple semantic versioning while the plugin is young:
 
 ### Fixed
 
+- Presence diagnostics no longer include configuration values or raw websocket error text.
 - `_fluxer_env` now reads settings through Hermes' `gateway.platforms._shared.get_scoped_secret` helper (falling back to `agent.secret_scope.get_secret` and raw `os.getenv` on older hosts). On Hermes gateways running with `gateway.multiplex_profiles` enabled (v0.21+), the default profile's adapter is validated and constructed outside any `set_secret_scope(...)` block, where `get_secret` fails closed with `UnscopedSecretError`; the old helper raised there and the platform failed to start with "No adapter available for fluxer".
 
 ### Notes
